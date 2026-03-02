@@ -104,7 +104,7 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
 
 async fn handle_stop_command(args: &[String], _output: &UserOutput) -> Result<()> {
     let config = RecorderConfig::new();
-    let session_id = if args.len() > 2 {
+    let session_id = if args.len() > 2 && !args[2].starts_with("--") {
         Some(args[2].clone())
     } else {
         None
@@ -115,7 +115,7 @@ async fn handle_stop_command(args: &[String], _output: &UserOutput) -> Result<()
 
 async fn handle_mute_command(args: &[String], _output: &UserOutput) -> Result<()> {
     let config = RecorderConfig::new();
-    let session_id = if args.len() > 2 {
+    let session_id = if args.len() > 2 && !args[2].starts_with("--") {
         Some(args[2].clone())
     } else {
         None

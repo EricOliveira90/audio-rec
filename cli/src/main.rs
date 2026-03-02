@@ -16,7 +16,27 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("Audio Recorder Manager CLI started");
-    let result = cli::run(args).await;
+
+    // Strip global flags before passing to CLI dispatcher
+    // so they don't get misinterpreted as command arguments
+    let mut cli_args: Vec<String> = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        match arg.as_str() {
+            "--no-log-file" | "--no-log-terminal" => continue,
+            "--log-level" | "-l" => {
+                skip_next = true;
+                continue;
+            }
+            _ => cli_args.push(arg),
+        }
+    }
+
+    let result = cli::run(cli_args).await;
     if result.is_ok() {
         tracing::info!("CLI completed successfully");
     } else {
