@@ -125,7 +125,36 @@ impl From<&str> for SessionId {
     }
 }
 
-// RecordingSession will be added in Task 10 after RecordingQuality is defined
+#[derive(Debug, Clone)]
+pub struct RecordingSession {
+    pub id: SessionId,
+    pub format: AudioFormat,
+    pub quality: crate::recorder::RecordingQuality,
+    pub duration: RecordingDuration,
+    pub started_at: chrono::DateTime<Local>,
+}
+
+impl RecordingSession {
+    pub fn new(format: AudioFormat, quality: crate::recorder::RecordingQuality, duration: RecordingDuration) -> Self {
+        Self {
+            id: SessionId::new(),
+            format,
+            quality,
+            duration,
+            started_at: Local::now(),
+        }
+    }
+
+    pub fn filename(&self) -> String {
+        let timestamp = self.started_at.format("%Y-%m-%d-%H_%M");
+        format!("{}_recording.{}", timestamp, self.format.extension())
+    }
+
+    pub fn temp_filename(&self) -> String {
+        let timestamp = self.started_at.format("%Y-%m-%d-%H_%M");
+        format!("{}_recording.wav", timestamp)
+    }
+}
 
 #[cfg(test)]
 mod tests {
