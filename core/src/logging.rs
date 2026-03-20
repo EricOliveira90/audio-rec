@@ -16,7 +16,7 @@ const DEFAULT_LOG_RETENTION_DAYS: u64 = 7;
 
 /// Gets the log directory for the application on Windows
 ///
-/// Returns: `%APPDATA%\audio-recorder-manager\logs\`
+/// Returns: `%APPDATA%\audio-rec\logs\`
 pub fn get_log_dir() -> PathBuf {
     let app_data = std::env::var("APPDATA").unwrap_or_else(|_| {
         // Fallback to current directory if APPDATA is not set
@@ -27,7 +27,7 @@ pub fn get_log_dir() -> PathBuf {
     });
 
     let log_dir = PathBuf::from(app_data)
-        .join("audio-recorder-manager")
+        .join("audio-rec")
         .join("logs");
 
     // Create directory if it doesn't exist
@@ -195,7 +195,7 @@ pub fn init_cli_logging(
     // Build the base filter
     let default_level = log_level.unwrap_or(Level::INFO);
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("audio_recorder_manager={}", default_level)));
+        .unwrap_or_else(|_| EnvFilter::new(format!("audio_rec={}", default_level)));
 
     let mut layers = Vec::new();
 
@@ -258,7 +258,7 @@ pub fn init_tauri_logging(
     // Build the base filter
     let default_level = log_level.unwrap_or(Level::INFO);
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("audio_recorder_manager={}", default_level)));
+        .unwrap_or_else(|_| EnvFilter::new(format!("audio_rec={}", default_level)));
 
     let mut layers = Vec::new();
 
@@ -306,7 +306,7 @@ pub fn init_test_logging() {
         .with_test_writer()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("audio_recorder_manager=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("audio_rec=debug")),
         )
         .try_init();
 }
@@ -318,8 +318,8 @@ mod tests {
     #[test]
     fn test_get_log_dir() {
         let log_dir = get_log_dir();
-        assert!(log_dir.ends_with("audio-recorder-manager\\logs") ||
-                log_dir.ends_with("audio-recorder-manager/logs"));
+        assert!(log_dir.ends_with("audio-rec\\logs") ||
+                log_dir.ends_with("audio-rec/logs"));
     }
 
     #[test]

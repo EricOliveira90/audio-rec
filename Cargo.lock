@@ -27,16 +27,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "audio-recorder-manager-cli"
+name = "audio-rec-cli"
 version = "0.1.0"
 dependencies = [
- "audio-recorder-manager-core",
+ "audio-rec-core",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "audio-recorder-manager-core"
+name = "audio-rec-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",

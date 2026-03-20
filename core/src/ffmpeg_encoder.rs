@@ -515,6 +515,136 @@ fn estimate_duration_from_filesize(path: &PathBuf) -> Result<u64> {
     Ok(duration_ms)
 }
 
+/// Check if FFmpeg is available in PATH
+/// Returns Ok(()) if available, Err with message if not
+pub fn check_ffmpeg_available() -> Result<()> {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.arg("-version");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: Approved for FFmpeg to prevent console window flashing on Windows
+        cmd.creation_flags(0x08000000);
+    }
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => Ok(()),
+        _ => Err(anyhow::anyhow!(
+            "FFmpeg is not installed or not found in PATH. FFmpeg is required for audio processing. Please install FFmpeg and ensure it's in your system PATH."
+        )),
+    }
+}
+
+/// Trim silence from an audio file using FFmpeg's silenceremove filter
+///
+/// - Removes leading silence completely
+/// - Removes trailing silence completely
+/// - Caps internal silence gaps at `max_internal_silence_secs` (default 2.0s)
+///
+/// Returns the path to the trimmed file (replaces the original)
+pub async fn trim_silence(
+    input_path: &PathBuf,
+    silence_threshold_db: f64,
+    max_internal_silence_secs: f64,
+) -> Result<PathBuf> {
+    use std::time::Instant;
+
+    let start_time = Instant::now();
+
+    // Create a temporary output path
+    let trimmed_path = input_path.with_extension("trimmed.tmp");
+
+    // Get the actual extension for the final output
+    let extension = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav");
+
+    tracing::info!("═══════════════════════════════════════════════════════════");
+    tracing::info!("✂️  SILENCE TRIMMING STARTED");
+    tracing::info!("═══════════════════════════════════════════════════════════");
+    tracing::info!("    Input:              {:?}", input_path.file_name().unwrap_or_default());
+    tracing::info!("    Threshold:          {} dB", silence_threshold_db);
+    tracing::info!("    Max internal gap:   {}s", max_internal_silence_secs);
+
+    // Build FFmpeg command with silenceremove filter
+    // The filter works in two passes:
+    // 1. Remove leading silence (start_periods=1)
+    // 2. Remove trailing silence (stop_periods=-1)
+    // 3. Cap internal silence via stop_duration parameter
+    //
+    // silenceremove parameters:
+    // - start_periods=1: remove silence from the beginning (1 period of non-silence starts output)
+    // - start_duration=0: don't keep any leading silence
+    // - start_threshold: amplitude threshold below which is considered silence
+    // - stop_periods=-1: remove silence from the end (process entire file, remove trailing)
+    // - stop_duration: keep this much silence between non-silent sections (caps internal gaps)
+    // - stop_threshold: same threshold for trailing/internal silence detection
+    let filter = format!(
+        "silenceremove=start_periods=1:start_duration=0:start_threshold={}dB:stop_periods=-1:stop_duration={}:stop_threshold={}dB",
+        silence_threshold_db,
+        max_internal_silence_secs,
+        silence_threshold_db
+    );
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+        .arg("-loglevel").arg("error")
+        .arg("-i").arg(input_path)
+        .arg("-af").arg(&filter);
+
+    // Preserve encoding based on format
+    if extension == "m4a" {
+        cmd.arg("-c:a").arg("aac")
+            .arg("-b:a").arg("192k")
+            .arg("-movflags").arg("faststart");
+    }
+
+    cmd.arg("-y").arg(&trimmed_path);
+
+    // CREATE_NO_WINDOW: Approved for FFmpeg to prevent console window flashing on Windows
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!("Silence trimming failed: {}. Keeping original file.", stderr);
+        // Clean up temp file if it exists
+        let _ = std::fs::remove_file(&trimmed_path);
+        // Return original path — trimming failure is non-fatal
+        return Ok(input_path.clone());
+    }
+
+    // Verify the trimmed file is valid (non-zero size)
+    let trimmed_size = std::fs::metadata(&trimmed_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    if trimmed_size == 0 {
+        tracing::warn!("Trimmed file is empty (entire recording was silence). Keeping original.");
+        let _ = std::fs::remove_file(&trimmed_path);
+        return Ok(input_path.clone());
+    }
+
+    // Replace original with trimmed version
+    std::fs::remove_file(input_path)?;
+    std::fs::rename(&trimmed_path, input_path)?;
+
+    let elapsed = start_time.elapsed();
+    let original_size_info = std::fs::metadata(input_path)
+        .map(|m| format!("{:.2} MB", m.len() as f64 / (1024.0 * 1024.0)))
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    tracing::info!("✂️  Silence trimming completed in {:.2}s", elapsed.as_secs_f64());
+    tracing::info!("    Output size: {}", original_size_info);
+    tracing::info!("═══════════════════════════════════════════════════════════");
+
+    Ok(input_path.clone())
+}
+
 /// Convert WAV file to M4A using optimized software AAC encoding
 pub async fn convert_wav_to_m4a_optimized(
     wav_path: &PathBuf,

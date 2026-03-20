@@ -54,36 +54,40 @@ impl AudioFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingDuration {
-    Fixed(u64),          // seconds
-    Manual { max: u64 }, // -1 becomes this
+    Fixed(u64),   // seconds
+    Indefinite,   // runs until stopped (no time limit)
 }
 
 impl RecordingDuration {
-    pub fn from_secs(duration: i64, max_manual_duration: u64) -> Result<Self> {
+    pub fn from_secs(duration: i64) -> Result<Self> {
         match duration {
-            -1 => Ok(RecordingDuration::Manual {
-                max: max_manual_duration,
-            }),
+            0 | -1 => Ok(RecordingDuration::Indefinite),
             d if d > 0 => Ok(RecordingDuration::Fixed(d as u64)),
             d => Err(RecorderError::InvalidParameter(format!(
-                "Duration must be -1 (manual mode) or a positive number, got: {}",
+                "Duration must be 0 (indefinite), -1 (indefinite), or a positive number, got: {}",
                 d
             ))),
         }
     }
 
+    /// Returns the effective duration in seconds.
+    /// For indefinite recordings, returns 0 (meaning no limit).
     pub fn effective_duration(&self) -> u64 {
         match self {
             RecordingDuration::Fixed(d) => *d,
-            RecordingDuration::Manual { max } => *max,
+            RecordingDuration::Indefinite => 0,
         }
     }
 
     pub fn to_api_value(&self) -> i64 {
         match self {
             RecordingDuration::Fixed(d) => *d as i64,
-            RecordingDuration::Manual { .. } => -1,
+            RecordingDuration::Indefinite => -1,
         }
+    }
+
+    pub fn is_indefinite(&self) -> bool {
+        matches!(self, RecordingDuration::Indefinite)
     }
 }
 
@@ -206,29 +210,32 @@ mod tests {
 
     #[test]
     fn test_recording_duration_fixed() {
-        let duration = RecordingDuration::from_secs(60, 7200).unwrap();
+        let duration = RecordingDuration::from_secs(60).unwrap();
         assert_eq!(duration, RecordingDuration::Fixed(60));
         assert_eq!(duration.effective_duration(), 60);
         assert_eq!(duration.to_api_value(), 60);
+        assert!(!duration.is_indefinite());
     }
 
     #[test]
-    fn test_recording_duration_manual() {
-        let duration = RecordingDuration::from_secs(-1, 7200).unwrap();
-        assert_eq!(duration, RecordingDuration::Manual { max: 7200 });
-        assert_eq!(duration.effective_duration(), 7200);
+    fn test_recording_duration_indefinite_minus_one() {
+        let duration = RecordingDuration::from_secs(-1).unwrap();
+        assert_eq!(duration, RecordingDuration::Indefinite);
+        assert_eq!(duration.effective_duration(), 0);
         assert_eq!(duration.to_api_value(), -1);
+        assert!(duration.is_indefinite());
     }
 
     #[test]
-    fn test_recording_duration_invalid_zero() {
-        let result = RecordingDuration::from_secs(0, 7200);
-        assert!(result.is_err());
+    fn test_recording_duration_indefinite_zero() {
+        let duration = RecordingDuration::from_secs(0).unwrap();
+        assert_eq!(duration, RecordingDuration::Indefinite);
+        assert!(duration.is_indefinite());
     }
 
     #[test]
     fn test_recording_duration_invalid_negative() {
-        let result = RecordingDuration::from_secs(-2, 7200);
+        let result = RecordingDuration::from_secs(-2);
         assert!(result.is_err());
     }
 

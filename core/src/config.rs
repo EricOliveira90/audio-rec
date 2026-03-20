@@ -12,8 +12,6 @@ pub struct RecorderConfig {
     pub status_dir: PathBuf,
     pub signals_dir: PathBuf,
     #[serde(skip)]
-    pub max_manual_duration_secs: u64,
-    #[serde(skip)]
     pub status_update_interval: Duration,
     #[serde(skip)]
     pub file_write_delay_ms: u64,
@@ -68,7 +66,6 @@ impl RecorderConfig {
             status_dir: storage_dir.join("status"),
             signals_dir: storage_dir.join("signals"),
             storage_dir,
-            max_manual_duration_secs: 7200,
             status_update_interval: Duration::from_secs(1),
             file_write_delay_ms: 500,
         }
@@ -90,7 +87,7 @@ impl RecorderConfig {
     fn get_config_file_path() -> Result<PathBuf> {
         let config_dir = dirs::config_dir()
             .context("Failed to get config directory")?
-            .join("audio-recorder-manager");
+            .join("audio-rec");
 
         fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
 
@@ -121,7 +118,6 @@ impl RecorderConfig {
         let mut config = Self::from_storage_dir(storage_dir);
 
         // Set non-serialized fields
-        config.max_manual_duration_secs = 7200;
         config.status_update_interval = Duration::from_secs(1);
         config.file_write_delay_ms = 500;
 

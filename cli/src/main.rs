@@ -1,7 +1,7 @@
 mod cli;
 
-use audio_recorder_manager_core::logging;
-use audio_recorder_manager_core::Result;
+use audio_rec_core::logging;
+use audio_rec_core::Result;
 use std::env;
 use tracing::Level;
 

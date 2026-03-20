@@ -1,4 +1,5 @@
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,50 +17,79 @@ use crate::wasapi::loopback::WasapiLoopbackRecorder;
 #[cfg(windows)]
 use crate::wasapi::microphone::WasapiMicrophoneRecorder;
 
+/// Options for the record command
+#[derive(Debug, Clone)]
+pub struct RecordOptions {
+    pub duration: RecordingDuration,
+    pub audio_format: AudioFormat,
+    pub quality: RecordingQuality,
+    pub output_path: Option<PathBuf>,
+    pub mic_muted: bool,
+    pub trim_silence: bool,
+}
+
+/// Emit a structured JSON event to stdout for the calling tool
+fn emit_event(event: &serde_json::Value) {
+    if let Ok(json_str) = serde_json::to_string(event) {
+        println!("{}", json_str);
+    }
+}
+
 /// Execute the record command
-pub async fn execute(
-    duration: RecordingDuration,
-    audio_format: AudioFormat,
-    quality: RecordingQuality,
-    config: RecorderConfig,
-) -> Result<()> {
-    execute_with_output(duration, audio_format, quality, config, UserOutput::new()).await
+pub async fn execute(options: RecordOptions, config: RecorderConfig) -> Result<()> {
+    execute_with_output(options, config, UserOutput::new()).await
 }
 
 /// Execute the record command with custom output
 pub async fn execute_with_output(
-    duration: RecordingDuration,
-    audio_format: AudioFormat,
-    quality: RecordingQuality,
+    options: RecordOptions,
     config: RecorderConfig,
     output: UserOutput,
 ) -> Result<()> {
-    // Note: Logging is initialized by the binary (CLI or Tauri), not here
+    // Check FFmpeg availability before starting
+    if let Err(e) = crate::ffmpeg_encoder::check_ffmpeg_available() {
+        emit_event(&json!({
+            "type": "error",
+            "message": e.to_string()
+        }));
+        return Err(crate::error::RecorderError::Other(e));
+    }
 
     // Create recording session
-    let session = RecordingSession::new(audio_format, quality.clone(), duration);
+    let session = RecordingSession::new(options.audio_format, options.quality.clone(), options.duration);
 
-    // Ensure directories exist
+    // Determine final output path
+    let final_output_path = if let Some(ref path) = options.output_path {
+        // User specified a path — ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        path.clone()
+    } else {
+        // Default: current working directory + auto-generated filename
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        cwd.join(session.filename())
+    };
+
+    // Ensure internal directories exist (for status/signals/temp files)
     config.ensure_directories()?;
 
-    // Return success result with final filename
-    let result = json!({
-        "status": "success",
-        "data": {
-            "session_id": session.id.as_str(),
-            "file_path": config.recordings_dir.join(session.filename()).to_string_lossy(),
-            "filename": session.filename(),
-            "duration": duration.to_api_value(),
-            "quality": quality.name,
-            "message": "Recording started successfully"
-        }
-    });
-
-    // Print JSON immediately (like Python version does with print and flush)
-    println!("{}", serde_json::to_string(&result)?);
+    // Emit started event
+    emit_event(&json!({
+        "type": "started",
+        "session_id": session.id.as_str(),
+        "file_path": final_output_path.to_string_lossy(),
+        "duration": options.duration.to_api_value(),
+        "format": options.audio_format.to_string(),
+        "quality": options.quality.name,
+        "mic_muted": options.mic_muted,
+        "trim_silence": options.trim_silence,
+    }));
 
     // Now do the actual recording (this blocks, keeping process alive)
-    record_worker(session, config, output).await?;
+    record_worker(session, config, output, final_output_path, options.mic_muted, options.trim_silence).await?;
 
     Ok(())
 }
@@ -100,6 +130,9 @@ async fn record_worker(
     session: RecordingSession,
     config: RecorderConfig,
     output: UserOutput,
+    final_output_path: PathBuf,
+    mic_muted: bool,
+    trim_silence: bool,
 ) -> Result<()> {
     // Capture values for the span before moving session
     let session_id = session.id.clone();
@@ -107,7 +140,6 @@ async fn record_worker(
     let duration_secs = session.duration.effective_duration();
 
     async move {
-        let filepath = config.recordings_dir.join(session.temp_filename());
         let observer = Arc::new(JsonFileObserver::new(config.status_dir.clone()));
         let effective_duration = session.duration.effective_duration();
 
@@ -115,9 +147,10 @@ async fn record_worker(
         #[cfg(windows)]
         {
         tracing::info!(
-            "Starting WASAPI dual-channel recording: {} ({} seconds)",
+            "Starting WASAPI dual-channel recording: {} ({} seconds, mic_muted: {})",
             session.temp_filename(),
-            effective_duration
+            effective_duration,
+            mic_muted
         );
 
         // Create temporary filenames for separate recordings
@@ -137,8 +170,8 @@ async fn record_worker(
         let target_sample_rate = loopback_recorder.get_sample_rate();
         tracing::info!("System audio sample rate: {} Hz - will match microphone to this", target_sample_rate);
 
-        // Create mute flag for microphone
-        let is_mic_muted = Arc::new(AtomicBool::new(false));
+        // Create mute flag for microphone (start muted if requested)
+        let is_mic_muted = Arc::new(AtomicBool::new(mic_muted));
 
         // Initialize microphone recorder with matched sample rate and mute flag
         let mic_recorder = match WasapiMicrophoneRecorder::new(
@@ -148,6 +181,9 @@ async fn record_worker(
         ) {
             Ok(recorder) => {
                 tracing::info!("Microphone recorder initialized successfully with matched sample rate");
+                if mic_muted {
+                    tracing::info!("Microphone starting in MUTED state");
+                }
                 Some(recorder)
             }
             Err(e) => {
@@ -195,8 +231,8 @@ async fn record_worker(
 
             let elapsed = start_time.elapsed().as_secs();
 
-            // Check for stop conditions
-            if elapsed >= effective_duration {
+            // Check for time limit (0 = indefinite)
+            if effective_duration > 0 && elapsed >= effective_duration {
                 break;
             }
 
@@ -232,6 +268,12 @@ async fn record_worker(
                     message: "Recording cancelled by user".to_string(),
                 })?;
 
+                emit_event(&json!({
+                    "type": "cancelled",
+                    "session_id": session.id.as_str(),
+                    "message": "Recording cancelled by user"
+                }));
+
                 output.warning("Recording cancelled by user");
                 return Ok(());
             }
@@ -253,6 +295,13 @@ async fn record_worker(
                 if mic_recorder.is_some() {
                     let was_muted = is_mic_muted.fetch_xor(true, Ordering::Relaxed);
                     let now_muted = !was_muted;
+
+                    emit_event(&json!({
+                        "type": "muted",
+                        "session_id": session.id.as_str(),
+                        "is_muted": now_muted
+                    }));
+
                     if now_muted {
                         tracing::info!("Microphone muted for session {}", session.id);
                         output.prefixed("Mute", "Microphone muted");
@@ -269,8 +318,20 @@ async fn record_worker(
             let progress = if effective_duration > 0 {
                 ((elapsed as f64 / effective_duration as f64) * 100.0).min(100.0) as u8
             } else {
-                0
+                0 // Indefinite mode — no progress percentage
             };
+
+            // Emit progress event
+            emit_event(&json!({
+                "type": "progress",
+                "session_id": session.id.as_str(),
+                "elapsed": elapsed,
+                "duration": effective_duration,
+                "progress": progress,
+                "is_mic_muted": is_mic_muted.load(Ordering::Relaxed),
+                "loopback_has_audio": loopback_recorder.has_audio_detected(),
+                "mic_has_audio": mic_recorder.as_ref().map(|m| m.has_audio_detected()),
+            }));
 
             // Print progress to terminal (dual-channel format)
             if let Some(ref mic) = mic_recorder {
@@ -284,10 +345,8 @@ async fn record_worker(
                 output.prefixed(
                     "Recording",
                     &format!(
-                        "Progress: {}% | Elapsed: {}s / {}s | Loopback: {} frames ({}) | Mic: {} frames ({})",
-                        progress,
+                        "Elapsed: {}s | Loopback: {} frames ({}) | Mic: {} frames ({})",
                         elapsed,
-                        effective_duration,
                         loopback_recorder.get_frames_captured(),
                         if loopback_recorder.has_audio_detected() { "Audio" } else { "Silent" },
                         mic.get_frames_captured(),
@@ -298,10 +357,8 @@ async fn record_worker(
                 output.prefixed(
                     "Recording",
                     &format!(
-                        "Progress: {}% | Elapsed: {}s / {}s | Loopback: {} frames ({})",
-                        progress,
+                        "Elapsed: {}s | Loopback: {} frames ({})",
                         elapsed,
-                        effective_duration,
                         loopback_recorder.get_frames_captured(),
                         if loopback_recorder.has_audio_detected() { "Audio" } else { "Silent" }
                     )
@@ -344,8 +401,16 @@ async fn record_worker(
             mic.stop()?;
         }
 
-        tracing::info!("Recording completed, starting post-processing");
+        let actual_elapsed = start_time.elapsed().as_secs();
+        tracing::info!("Recording completed after {}s, starting post-processing", actual_elapsed);
         output.success("Recording completed successfully!");
+
+        emit_event(&json!({
+            "type": "processing",
+            "session_id": session.id.as_str(),
+            "message": "Post-processing started",
+            "elapsed_secs": actual_elapsed,
+        }));
 
         // Wait for temporary files to be fully written and readable before processing
         tracing::info!("Waiting for temporary files to be ready...");
@@ -353,11 +418,13 @@ async fn record_worker(
         let _ = wait_for_file_ready(&mic_temp, 2000).await;
         tracing::info!("Temporary files are ready for processing");
 
-        // Determine total steps based on format
-        let total_steps = if matches!(session.format, AudioFormat::M4a) {
-            4  // M4A: Analyze -> Merge -> Encode -> Finalize
-        } else {
-            3  // WAV: Analyze -> Merge -> Finalize
+        // Determine total steps based on format and trimming
+        let has_trim = trim_silence;
+        let total_steps = match (session.format, has_trim) {
+            (AudioFormat::M4a, true) => 5,   // Analyze -> Merge -> Encode -> Trim -> Finalize
+            (AudioFormat::M4a, false) => 4,  // Analyze -> Merge -> Encode -> Finalize
+            (AudioFormat::Wav, true) => 4,   // Analyze -> Merge -> Trim -> Finalize
+            (AudioFormat::Wav, false) => 3,  // Analyze -> Merge -> Finalize
         };
 
         // Stage 1: Analyzing Audio
@@ -382,25 +449,29 @@ async fn record_worker(
             Some(total_steps),
             Some("analyzing"),
             None,
-            None, // Duration will be determined from actual audio file during processing
+            None,
         );
 
         tracing::info!("Post-processing started");
 
-        // Merge audio channels (and encode to M4A if requested) in a span for better tracing
+        // Determine the merge output path (temp location in recordings dir)
+        let merge_output_path = if matches!(session.format, AudioFormat::M4a) {
+            config.recordings_dir.join(format!("{}_merged.m4a", session.id.as_str()))
+        } else {
+            config.recordings_dir.join(format!("{}_merged.wav", session.id.as_str()))
+        };
+
+        // Merge audio channels (and encode to M4A if requested)
         {
             let loopback_has_audio_flag = loopback_recorder.has_audio_detected();
             let mic_has_audio_flag = mic_recorder.as_ref().map(|m| m.has_audio_detected()).unwrap_or(false);
 
             async {
-                // Determine output file based on format
-                let merge_output_path = if matches!(session.format, AudioFormat::M4a) {
+                if matches!(session.format, AudioFormat::M4a) {
                     output.prefixed("Processing", "Merging and encoding to M4A...");
-                    filepath.with_extension("m4a")
                 } else {
                     output.prefixed("Processing", "Merging audio channels...");
-                    filepath.clone()
-                };
+                }
 
                 // Small delay to ensure status file was written before merge starts
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -411,8 +482,7 @@ async fn record_worker(
                     .map(|m| m.has_audio_detected())
                     .unwrap_or(false);
 
-                // Stage 2 will be emitted inside merge_audio_streams_smart for better granularity
-                // Merge audio streams using FFmpeg (with direct M4A encoding if requested)
+                // Merge audio streams using FFmpeg
                 merge_audio_streams_smart(
                     &loopback_temp,
                     &mic_temp,
@@ -439,60 +509,95 @@ async fn record_worker(
             .await?;
         }
 
-        // Cleanup temporary files
+        // Cleanup temporary recording files
         let _ = std::fs::remove_file(&loopback_temp);
         let _ = std::fs::remove_file(&mic_temp);
-        tracing::info!("Temporary files cleaned up");
+        tracing::info!("Temporary recording files cleaned up");
 
-        // Clean up stale mute signal after post-processing
+        // Clean up stale mute signal
         let mute_signal = config.signals_dir.join(format!("{}.mute", session.id.as_str()));
         let _ = std::fs::remove_file(&mute_signal);
+
+        // Silence trimming (if enabled)
+        if trim_silence {
+            tracing::info!("Trimming silence from recording...");
+            output.prefixed("Processing", "Trimming silence...");
+
+            emit_event(&json!({
+                "type": "processing",
+                "session_id": session.id.as_str(),
+                "message": "Trimming silence",
+            }));
+
+            // Trim with -50dB threshold and 2s max internal silence
+            let _ = crate::ffmpeg_encoder::trim_silence(
+                &merge_output_path,
+                -50.0,
+                2.0,
+            ).await;
+
+            tracing::info!("Silence trimming completed");
+        }
+
+        // Move the processed file to the final output path
+        if let Some(parent) = final_output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        // Copy then remove (works across drives, unlike rename)
+        std::fs::copy(&merge_output_path, &final_output_path)?;
+        let _ = std::fs::remove_file(&merge_output_path);
+
+        tracing::info!("Final file saved to: {:?}", final_output_path);
         }
 
         #[cfg(not(windows))]
         {
-            // TODO: Implement cross-platform recording support using cpal
-            // For now, this application only supports Windows (WASAPI)
             return Err(crate::error::RecorderError::Other(anyhow::anyhow!(
                 "Recording is currently only supported on Windows. Cross-platform support (Linux/macOS) is planned for a future release."
             )));
         }
 
-        // Determine final filepath based on format
-        // For M4A, we already have the final file (merge+encode was done in one pass)
-        // For WAV, filepath is already correct
-        let final_filepath = if matches!(session.format, AudioFormat::M4a) {
-            filepath.with_extension("m4a")
-        } else {
-            filepath.clone()
-        };
-
-        // Write final status
-        let file_size_mb = if final_filepath.exists() {
-            let size = std::fs::metadata(&final_filepath)?.len();
+        // Get final file info
+        let file_size_mb = if final_output_path.exists() {
+            let size = std::fs::metadata(&final_output_path)?.len();
             (size as f64) / (1024.0 * 1024.0)
         } else {
             0.0
         };
 
+        let final_filename = final_output_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Write final status to status file
         observer.on_complete(RecordingResult {
             status: "completed".to_string(),
             session_id: session.id.as_str().to_string(),
-            filename: final_filepath
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            file_path: Some(final_filepath.to_string_lossy().to_string()),
+            filename: final_filename.clone(),
+            file_path: Some(final_output_path.to_string_lossy().to_string()),
             duration: session.duration.to_api_value(),
             file_size_mb: format!("{:.2}", file_size_mb),
             format: session.format.to_string(),
             codec: session.format.codec().to_string(),
-            message: match session.format {
-                AudioFormat::M4a => "Recording converted to M4A successfully".to_string(),
-                AudioFormat::Wav => "Recording completed successfully".to_string(),
-            },
+            message: "Recording completed successfully".to_string(),
         })?;
+
+        // Emit completed event to stdout (this is what the calling tool reads)
+        emit_event(&json!({
+            "type": "completed",
+            "session_id": session.id.as_str(),
+            "file_path": final_output_path.to_string_lossy(),
+            "filename": final_filename,
+            "file_size_mb": format!("{:.2}", file_size_mb),
+            "format": session.format.to_string(),
+            "duration_secs": session.duration.to_api_value(),
+            "message": "Recording completed successfully"
+        }));
 
         Ok(())
     }
