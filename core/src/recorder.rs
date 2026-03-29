@@ -378,10 +378,19 @@ pub async fn merge_audio_streams_smart(
         }
     };
 
+    // Calculate max duration in seconds for use in filters (to pad shorter input)
+    let max_duration_secs = (effective_duration_ms as f64 / 1000.0).ceil() as u64;
+
     let output = if loopback_has_audio && mic_has_audio {
         // Scenario A: Both have audio - Create dual-mono stereo (L=loopback, R=mic)
-        // Convert mic mono to stereo first, then merge with amerge
+        // Use apad with whole_dur to pad the shorter input to match the longer one,
+        // preventing amerge from truncating to the shortest input.
         tracing::info!("📋 Merge Strategy: Dual-mono stereo (L=loopback, R=microphone)");
+
+        let filter = format!(
+            "[0:a]aformat=channel_layouts=stereo,apad=whole_dur={}[left];[1:a]aformat=channel_layouts=mono,apad=whole_dur={},asplit=2[ml][mr];[left][ml][mr]amerge=inputs=3,pan=stereo|c0<c0+c2|c1<c1+c2[aout]",
+            max_duration_secs, max_duration_secs
+        );
 
         let mut cmd = setup_ffmpeg_command();
         cmd.arg("-hide_banner")
@@ -389,7 +398,7 @@ pub async fn merge_audio_streams_smart(
             .arg("-i").arg(loopback_wav)
             .arg("-i").arg(mic_wav)
             .arg("-filter_complex")
-            .arg("[0:a]aformat=channel_layouts=stereo[left];[1:a]aformat=channel_layouts=mono,asplit=2[ml][mr];[left][ml][mr]amerge=inputs=3,pan=stereo|c0<c0+c2|c1<c1+c2[aout]")
+            .arg(&filter)
             .arg("-filter_threads").arg("auto")  // Enable parallel filter processing
             .arg("-map").arg("[aout]")
             .arg("-ar").arg(&target_sample_rate);

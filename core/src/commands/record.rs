@@ -26,6 +26,8 @@ pub struct RecordOptions {
     pub output_path: Option<PathBuf>,
     pub mic_muted: bool,
     pub trim_silence: bool,
+    pub input_device_index: Option<u32>,
+    pub output_device_index: Option<u32>,
 }
 
 /// Emit a structured JSON event to stdout for the calling tool
@@ -55,6 +57,47 @@ pub async fn execute_with_output(
         return Err(crate::error::RecorderError::Other(e));
     }
 
+    // Validate and resolve device indices early (before creating session)
+    #[cfg(windows)]
+    let (input_device_name, output_device_name) = {
+        use crate::wasapi::device_enumeration::{enumerate_devices, validate_device_index, DeviceDirection};
+
+        let input_name = if let Some(idx) = options.input_device_index {
+            let devices = enumerate_devices(DeviceDirection::Input)?;
+            let device = validate_device_index(idx, &devices, DeviceDirection::Input)
+                .map_err(|e| {
+                    emit_event(&json!({
+                        "type": "error",
+                        "message": e.to_string()
+                    }));
+                    e
+                })?;
+            Some(device.name.clone())
+        } else {
+            None
+        };
+
+        let output_name = if let Some(idx) = options.output_device_index {
+            let devices = enumerate_devices(DeviceDirection::Output)?;
+            let device = validate_device_index(idx, &devices, DeviceDirection::Output)
+                .map_err(|e| {
+                    emit_event(&json!({
+                        "type": "error",
+                        "message": e.to_string()
+                    }));
+                    e
+                })?;
+            Some(device.name.clone())
+        } else {
+            None
+        };
+
+        (input_name, output_name)
+    };
+
+    #[cfg(not(windows))]
+    let (input_device_name, output_device_name): (Option<String>, Option<String>) = (None, None);
+
     // Create recording session
     let session = RecordingSession::new(options.audio_format, options.quality.clone(), options.duration);
 
@@ -76,8 +119,8 @@ pub async fn execute_with_output(
     // Ensure internal directories exist (for status/signals/temp files)
     config.ensure_directories()?;
 
-    // Emit started event
-    emit_event(&json!({
+    // Emit started event (includes device names when specified)
+    let mut started_event = json!({
         "type": "started",
         "session_id": session.id.as_str(),
         "file_path": final_output_path.to_string_lossy(),
@@ -86,10 +129,28 @@ pub async fn execute_with_output(
         "quality": options.quality.name,
         "mic_muted": options.mic_muted,
         "trim_silence": options.trim_silence,
-    }));
+    });
+    if let Some(ref name) = input_device_name {
+        started_event["input_device"] = json!(name);
+        started_event["input_device_index"] = json!(options.input_device_index);
+    }
+    if let Some(ref name) = output_device_name {
+        started_event["output_device"] = json!(name);
+        started_event["output_device_index"] = json!(options.output_device_index);
+    }
+    emit_event(&started_event);
 
     // Now do the actual recording (this blocks, keeping process alive)
-    record_worker(session, config, output, final_output_path, options.mic_muted, options.trim_silence).await?;
+    record_worker(
+        session,
+        config,
+        output,
+        final_output_path,
+        options.mic_muted,
+        options.trim_silence,
+        options.input_device_index,
+        options.output_device_index,
+    ).await?;
 
     Ok(())
 }
@@ -133,6 +194,8 @@ async fn record_worker(
     final_output_path: PathBuf,
     mic_muted: bool,
     trim_silence: bool,
+    input_device_index: Option<u32>,
+    output_device_index: Option<u32>,
 ) -> Result<()> {
     // Capture values for the span before moving session
     let session_id = session.id.clone();
@@ -164,7 +227,12 @@ async fn record_worker(
         ));
 
         // Initialize loopback recorder (system audio) - REQUIRED
-        let loopback_recorder = WasapiLoopbackRecorder::new(loopback_temp.clone())?;
+        let loopback_recorder = if let Some(idx) = output_device_index {
+            tracing::info!("Using output device index {} for loopback recording", idx);
+            WasapiLoopbackRecorder::with_device_index(loopback_temp.clone(), Some(idx))?
+        } else {
+            WasapiLoopbackRecorder::new(loopback_temp.clone())?
+        };
 
         // Get loopback sample rate to match microphone
         let target_sample_rate = loopback_recorder.get_sample_rate();
@@ -174,11 +242,21 @@ async fn record_worker(
         let is_mic_muted = Arc::new(AtomicBool::new(mic_muted));
 
         // Initialize microphone recorder with matched sample rate and mute flag
-        let mic_recorder = match WasapiMicrophoneRecorder::new(
-            mic_temp.clone(),
-            target_sample_rate,
-            is_mic_muted.clone(),
-        ) {
+        let mic_recorder = match if let Some(idx) = input_device_index {
+            tracing::info!("Using input device index {} for microphone recording", idx);
+            WasapiMicrophoneRecorder::with_device_index(
+                mic_temp.clone(),
+                target_sample_rate,
+                is_mic_muted.clone(),
+                Some(idx),
+            )
+        } else {
+            WasapiMicrophoneRecorder::new(
+                mic_temp.clone(),
+                target_sample_rate,
+                is_mic_muted.clone(),
+            )
+        } {
             Ok(recorder) => {
                 tracing::info!("Microphone recorder initialized successfully with matched sample rate");
                 if mic_muted {

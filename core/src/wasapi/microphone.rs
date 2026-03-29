@@ -31,6 +31,10 @@ pub struct WasapiMicrophoneRecorder {
 
 impl WasapiMicrophoneRecorder {
     pub fn new(filepath: PathBuf, target_sample_rate: u32, is_muted: Arc<AtomicBool>) -> Result<Self> {
+        Self::with_device_index(filepath, target_sample_rate, is_muted, None)
+    }
+
+    pub fn with_device_index(filepath: PathBuf, target_sample_rate: u32, is_muted: Arc<AtomicBool>, device_index: Option<u32>) -> Result<Self> {
         let is_recording = Arc::new(AtomicBool::new(true));
         let frames_captured = Arc::new(AtomicU64::new(0));
         let has_audio = Arc::new(AtomicBool::new(false));
@@ -49,6 +53,7 @@ impl WasapiMicrophoneRecorder {
                 frames_captured_clone,
                 has_audio_clone,
                 is_muted_clone,
+                device_index,
             ) {
                 tracing::error!("Microphone recording thread error: {}", e);
                 tracing::error!("Error chain: {:?}", e);
@@ -70,6 +75,7 @@ impl WasapiMicrophoneRecorder {
         frames_captured: Arc<AtomicU64>,
         has_audio: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
+        device_index: Option<u32>,
     ) -> Result<()> {
         unsafe {
             // Initialize COM for this thread
@@ -77,11 +83,17 @@ impl WasapiMicrophoneRecorder {
                 .ok()
                 .context("Failed to initialize COM in recording thread")?;
 
-            // Get default audio endpoint for capture (microphone/input)
+            // Get audio endpoint for capture (microphone/input)
             let device_enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-            let device = device_enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?;
+            let device = if let Some(idx) = device_index {
+                tracing::info!("Using input device at index {}", idx);
+                let collection = device_enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+                collection.Item(idx).context(format!("Failed to get input device at index {}", idx))?
+            } else {
+                device_enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?
+            };
 
             // Activate audio client
             let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;

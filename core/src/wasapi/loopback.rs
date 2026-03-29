@@ -41,6 +41,10 @@ pub struct WasapiLoopbackRecorder {
 
 impl WasapiLoopbackRecorder {
     pub fn new(filepath: PathBuf) -> Result<Self> {
+        Self::with_device_index(filepath, None)
+    }
+
+    pub fn with_device_index(filepath: PathBuf, device_index: Option<u32>) -> Result<Self> {
         let is_recording = Arc::new(AtomicBool::new(true));
         let frames_captured = Arc::new(AtomicU64::new(0));
         let has_audio = Arc::new(AtomicBool::new(false));
@@ -58,7 +62,12 @@ impl WasapiLoopbackRecorder {
             let device_enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-            let device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+            let device = if let Some(idx) = device_index {
+                let collection = device_enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+                collection.Item(idx).context(format!("Failed to get output device at index {}", idx))?
+            } else {
+                device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?
+            };
 
             let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let mix_format = audio_client.GetMixFormat()?;
@@ -78,6 +87,7 @@ impl WasapiLoopbackRecorder {
                 is_recording_clone,
                 frames_captured_clone,
                 has_audio_clone,
+                device_index,
             );
         });
 
@@ -94,6 +104,7 @@ impl WasapiLoopbackRecorder {
         is_recording: Arc<AtomicBool>,
         frames_captured: Arc<AtomicU64>,
         has_audio: Arc<AtomicBool>,
+        device_index: Option<u32>,
     ) -> Result<()> {
         unsafe {
             // Initialize COM for this thread
@@ -101,11 +112,17 @@ impl WasapiLoopbackRecorder {
                 .ok()
                 .context("Failed to initialize COM in recording thread")?;
 
-            // Get default audio endpoint for rendering (speakers/output)
+            // Get audio endpoint for rendering (speakers/output)
             let device_enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-            let device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+            let device = if let Some(idx) = device_index {
+                tracing::info!("Using output device at index {}", idx);
+                let collection = device_enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+                collection.Item(idx).context(format!("Failed to get output device at index {}", idx))?
+            } else {
+                device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?
+            };
 
             // Activate audio client
             let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;

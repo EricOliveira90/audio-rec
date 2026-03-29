@@ -5,6 +5,9 @@ A Rust-based command-line tool for recording system audio and microphone on Wind
 ## Features
 
 - **Dual-channel recording** — Captures system audio (WASAPI loopback) and microphone simultaneously
+- **Device selection** — Choose specific audio input/output devices by index
+- **Device enumeration** — List all available audio devices with `audio-rec devices`
+- **Enhanced status** — View active recording session info (elapsed time, devices, audio detection, etc.)
 - **Structured JSON protocol** — All stdout output is JSON, one object per line, for easy parsing
 - **Silence trimming** — Automatically trims leading/trailing silence and caps internal silence gaps at 2 seconds
 - **Microphone mute** — Start muted or toggle mute during recording via IPC
@@ -70,8 +73,12 @@ audio-rec record [options]
 | `--duration <secs>` | `-d` | Recording duration in seconds | Indefinite (until `stop`) |
 | `--format <wav\|m4a>` | `-f` | Audio format | `wav` (or inferred from `--output` extension) |
 | `--quality <level>` | `-q` | Quality preset: `quick`, `standard`, `professional`, `high` | `professional` |
+| `--input-device <idx>` | `-i` | Input device index (microphone). Use `devices` to list. | System default |
+| `--output-device <idx>` | `-O` | Output device index (loopback). Use `devices` to list. | System default |
 | `--mic-muted` | | Start with microphone muted | Off |
 | `--no-trim` | | Disable automatic silence trimming | Trimming ON |
+
+> **Note:** The output device flag uses capital `-O` to avoid conflict with `-o` (output file path).
 
 **Examples:**
 
@@ -93,6 +100,12 @@ audio-rec record --no-trim -d 60
 
 # Quick quality, standard format
 audio-rec record -q quick -f m4a -d 120
+
+# Record using specific input and output devices
+audio-rec record -i 0 -O 1
+
+# Record using a specific microphone
+audio-rec record --input-device 1
 ```
 
 ### `stop` — Stop Recording
@@ -111,13 +124,66 @@ audio-rec mute [session_id]
 
 Toggles the microphone mute state on an active recording. When muted, the mic channel writes silence (zeros) instead of real audio, producing a continuous valid audio stream.
 
-### `status` — System Info
+### `devices` — List Audio Devices
+
+```bash
+audio-rec devices
+```
+
+Lists all available audio input (microphone) and output (speakers/headphones) devices as JSON. Use the device indices with `--input-device` / `--output-device` flags on the `record` command.
+
+**Example output:**
+
+```json
+{
+  "type": "devices",
+  "input_devices": [
+    {"index": 0, "name": "Microphone (Blue Yeti)", "is_default": true, "sample_rate": 48000, "channels": 2}
+  ],
+  "output_devices": [
+    {"index": 0, "name": "Speakers (Realtek)", "is_default": true, "sample_rate": 48000, "channels": 2},
+    {"index": 1, "name": "HDMI Audio (NVIDIA)", "is_default": false, "sample_rate": 48000, "channels": 8}
+  ]
+}
+```
+
+> **Note:** Device indices may change between runs if devices are plugged/unplugged. Run `audio-rec devices` before each recording session to get current indices.
+
+### `status` — Active Recording Info
 
 ```bash
 audio-rec status
 ```
 
-Reports platform and audio device information.
+Shows information about the active recording session, including elapsed time, devices in use, audio detection status, and more. When no recording is active, reports that no session is found.
+
+**Example output (active recording):**
+
+```json
+{
+  "type": "status",
+  "active": true,
+  "session_id": "rec-20260329_120000",
+  "filename": "recording.wav",
+  "elapsed": "2m 34s",
+  "duration": "indefinite",
+  "format": "wav",
+  "quality": "Professional (48kHz Stereo)",
+  "is_mic_muted": false,
+  "device": "Dual-Channel (System + Microphone)",
+  "sample_rate": 48000,
+  "loopback_has_audio": true,
+  "mic_has_audio": true,
+  "loopback_frames": 1500,
+  "mic_frames": 1200
+}
+```
+
+**Example output (no active recording):**
+
+```json
+{"type": "status", "active": false, "message": "No active recording session found"}
+```
 
 ## JSON Protocol (stdout)
 
@@ -136,11 +202,16 @@ All stdout output follows a structured JSON protocol — one JSON object per lin
   "format": "wav",
   "quality": "Professional (48kHz Stereo)",
   "mic_muted": false,
-  "trim_silence": true
+  "trim_silence": true,
+  "input_device": "Microphone (Blue Yeti)",
+  "input_device_index": 0,
+  "output_device": "Speakers (Realtek)",
+  "output_device_index": 0
 }
 ```
 
 - `duration`: `-1` means indefinite, positive number means fixed seconds
+- `input_device` / `output_device`: Only present when device selection flags are used
 
 #### `audio_state` — Audio state changed
 
@@ -285,11 +356,13 @@ audio-recorder-manager-efo/
 │       ├── recorder.rs           # Quality presets, smart audio merge (4 scenarios)
 │       ├── status.rs             # JSON status file observer
 │       ├── commands/
+│       │   ├── devices.rs        # Devices command (enumerate audio devices)
 │       │   ├── record.rs         # Record command (main recording lifecycle)
 │       │   ├── stop.rs           # Stop command (signal file IPC)
 │       │   ├── mute.rs           # Mute toggle command (signal file IPC)
-│       │   └── status.rs         # Status command
+│       │   └── status.rs         # Status command (active session info)
 │       └── wasapi/
+│           ├── device_enumeration.rs  # WASAPI device enumeration & validation
 │           ├── loopback.rs       # System audio capture (WASAPI loopback)
 │           └── microphone.rs     # Microphone capture (with mute support)
 ├── cli/                          # Binary crate
@@ -356,7 +429,9 @@ Log level can be set with `--log-level <trace|debug|info|warn|error>` (default: 
 - [ ] **Graceful shutdown** — Handle SIGTERM/Ctrl+C to properly finalize recordings instead of leaving corrupted temp files
 - [ ] **Audio normalization** — Optional loudness normalization via FFmpeg's `loudnorm` filter after recording
 - [ ] **Cross-platform support** — Linux (PulseAudio/PipeWire) and macOS (CoreAudio) recording backends
-- [ ] **Device selection** — Choose specific audio input/output devices instead of system defaults
+- [x] **Device selection** — Choose specific audio input/output devices by index (`--input-device` / `--output-device`)
+- [x] **Device enumeration** — List available audio devices with `audio-rec devices`
+- [x] **Enhanced status** — Show active recording session info (elapsed time, devices, audio detection, etc.)
 - [ ] **Real-time audio level monitoring** — Emit audio level (RMS/peak) in progress events for VU meter display
 - [ ] **Configurable silence parameters** — Expose silence threshold and max gap duration as CLI flags
 - [ ] **Pause/resume** — Pause recording without stopping (write silence during pause, or stop/restart WASAPI)

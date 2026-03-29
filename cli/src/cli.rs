@@ -21,6 +21,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 
     match command.as_str() {
         "record" => handle_record_command(&args, &output).await,
+        "devices" => commands::devices::execute().await,
         "status" => commands::status::execute().await,
         "stop" => handle_stop_command(&args, &output).await,
         "mute" => handle_mute_command(&args, &output).await,
@@ -120,6 +121,38 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
     let mic_muted = has_flag(args, "--mic-muted");
     let trim_silence = !has_flag(args, "--no-trim"); // On by default
 
+    // Parse --input-device / -i (optional device index for microphone)
+    let input_device_index = if let Some(idx_str) = parse_flag_value(args, "--input-device", Some("-i")) {
+        match idx_str.parse::<u32>() {
+            Ok(idx) => Some(idx),
+            Err(_) => {
+                output.error(&format!(
+                    "Invalid input device index '{}'. Must be a non-negative integer. Run 'audio-rec devices' to see available devices.",
+                    idx_str
+                ));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Parse --output-device / -O (capital O to avoid conflict with -o for output file path)
+    let output_device_index = if let Some(idx_str) = parse_flag_value(args, "--output-device", Some("-O")) {
+        match idx_str.parse::<u32>() {
+            Ok(idx) => Some(idx),
+            Err(_) => {
+                output.error(&format!(
+                    "Invalid output device index '{}'. Must be a non-negative integer. Run 'audio-rec devices' to see available devices.",
+                    idx_str
+                ));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let options = RecordOptions {
         duration,
         audio_format,
@@ -127,6 +160,8 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
         output_path,
         mic_muted,
         trim_silence,
+        input_device_index,
+        output_device_index,
     };
 
     commands::record::execute_with_output(options, config, output.clone()).await
@@ -164,15 +199,18 @@ fn print_usage() {
     println!();
     println!("COMMANDS:");
     println!("  record    Start recording audio");
+    println!("  devices   List all available audio input and output devices");
     println!("  stop      Stop an active recording");
     println!("  mute      Toggle microphone mute on an active recording");
-    println!("  status    Show system audio device info");
+    println!("  status    Show active recording session info");
     println!();
     println!("RECORD OPTIONS:");
     println!("  -o, --output <path>       Output file path (default: cwd/auto-name.wav)");
     println!("  -d, --duration <secs>     Recording duration in seconds (default: indefinite)");
     println!("  -f, --format <wav|m4a>    Audio format (default: wav, or inferred from --output)");
     println!("  -q, --quality <level>     Quality: quick, standard, professional, high (default: professional)");
+    println!("  -i, --input-device <idx>  Input device index (microphone). Use 'devices' to list.");
+    println!("  -O, --output-device <idx> Output device index (loopback). Use 'devices' to list.");
     println!("      --mic-muted           Start with microphone muted");
     println!("      --no-trim             Disable silence trimming (trimming is on by default)");
     println!();
@@ -190,8 +228,12 @@ fn print_usage() {
     println!("  audio-rec record -o C:\\recordings\\meeting.wav");
     println!("  audio-rec record -o meeting.m4a -d 60 --mic-muted");
     println!("  audio-rec record --no-trim -q standard");
+    println!("  audio-rec record -i 0 -O 1          # Use specific input/output devices");
+    println!("  audio-rec record --input-device 0    # Use specific microphone");
+    println!("  audio-rec devices                    # List available audio devices");
     println!("  audio-rec stop");
     println!("  audio-rec mute");
+    println!("  audio-rec status");
     println!();
     println!("JSON PROTOCOL (stdout):");
     println!("  All output is JSON, one object per line (events emitted only on state changes):");
@@ -201,4 +243,158 @@ fn print_usage() {
     println!("  {{\"type\": \"completed\", \"file_path\": \"...\", \"file_size_mb\": \"2.34\"}}");
     println!("  {{\"type\": \"error\", \"message\": \"...\"}}");
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_flag_value tests ──
+
+    #[test]
+    fn test_parse_flag_value_long_flag() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--input-device".into(),
+            "0".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--input-device", Some("-i")),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_flag_value_short_flag() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "-i".into(),
+            "2".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--input-device", Some("-i")),
+            Some("2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_flag_value_output_device_capital_o() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "-O".into(),
+            "1".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--output-device", Some("-O")),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_flag_value_missing_returns_none() {
+        let args: Vec<String> = vec!["audio-rec".into(), "record".into()];
+        assert_eq!(
+            parse_flag_value(&args, "--input-device", Some("-i")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_flag_value_no_conflict_between_o_and_capital_o() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "-o".into(),
+            "output.wav".into(),
+            "-O".into(),
+            "1".into(),
+        ];
+        // -o should match --output, not --output-device
+        assert_eq!(
+            parse_flag_value(&args, "--output", Some("-o")),
+            Some("output.wav".to_string())
+        );
+        // -O should match --output-device
+        assert_eq!(
+            parse_flag_value(&args, "--output-device", Some("-O")),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_flag_value_both_device_flags() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "-i".into(),
+            "0".into(),
+            "-O".into(),
+            "1".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--input-device", Some("-i")),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            parse_flag_value(&args, "--output-device", Some("-O")),
+            Some("1".to_string())
+        );
+    }
+
+    // ── RecordOptions construction tests ──
+
+    #[test]
+    fn test_record_options_default_device_indices_are_none() {
+        let options = RecordOptions {
+            duration: RecordingDuration::Indefinite,
+            audio_format: AudioFormat::Wav,
+            quality: RecordingQuality::professional(),
+            output_path: None,
+            mic_muted: false,
+            trim_silence: true,
+            input_device_index: None,
+            output_device_index: None,
+        };
+
+        assert!(options.input_device_index.is_none());
+        assert!(options.output_device_index.is_none());
+    }
+
+    #[test]
+    fn test_record_options_with_device_indices() {
+        let options = RecordOptions {
+            duration: RecordingDuration::Indefinite,
+            audio_format: AudioFormat::Wav,
+            quality: RecordingQuality::professional(),
+            output_path: None,
+            mic_muted: false,
+            trim_silence: true,
+            input_device_index: Some(0),
+            output_device_index: Some(1),
+        };
+
+        assert_eq!(options.input_device_index, Some(0));
+        assert_eq!(options.output_device_index, Some(1));
+    }
+
+    // ── has_flag tests ──
+
+    #[test]
+    fn test_has_flag_present() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--mic-muted".into(),
+        ];
+        assert!(has_flag(&args, "--mic-muted"));
+    }
+
+    #[test]
+    fn test_has_flag_absent() {
+        let args: Vec<String> = vec!["audio-rec".into(), "record".into()];
+        assert!(!has_flag(&args, "--mic-muted"));
+    }
 }
