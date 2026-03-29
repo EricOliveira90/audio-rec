@@ -121,8 +121,8 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
     let mic_muted = has_flag(args, "--mic-muted");
     let trim_silence = !has_flag(args, "--no-trim"); // On by default
 
-    // Parse --input-device / -i (optional device index for microphone)
-    let input_device_index = if let Some(idx_str) = parse_flag_value(args, "--input-device", Some("-i")) {
+    // Parse --input-device / -id (optional device index for microphone)
+    let input_device_index = if let Some(idx_str) = parse_flag_value(args, "--input-device", Some("-id")) {
         match idx_str.parse::<u32>() {
             Ok(idx) => Some(idx),
             Err(_) => {
@@ -137,8 +137,8 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
         None
     };
 
-    // Parse --output-device / -O (capital O to avoid conflict with -o for output file path)
-    let output_device_index = if let Some(idx_str) = parse_flag_value(args, "--output-device", Some("-O")) {
+    // Parse --output-device / -od (optional device index for loopback/output)
+    let output_device_index = if let Some(idx_str) = parse_flag_value(args, "--output-device", Some("-od")) {
         match idx_str.parse::<u32>() {
             Ok(idx) => Some(idx),
             Err(_) => {
@@ -209,8 +209,8 @@ fn print_usage() {
     println!("  -d, --duration <secs>     Recording duration in seconds (default: indefinite)");
     println!("  -f, --format <wav|m4a>    Audio format (default: wav, or inferred from --output)");
     println!("  -q, --quality <level>     Quality: quick, standard, professional, high (default: professional)");
-    println!("  -i, --input-device <idx>  Input device index (microphone). Use 'devices' to list.");
-    println!("  -O, --output-device <idx> Output device index (loopback). Use 'devices' to list.");
+    println!("  -id, --input-device <idx>  Input device index (microphone). Use 'devices' to list.");
+    println!("  -od, --output-device <idx> Output device index (loopback). Use 'devices' to list.");
     println!("      --mic-muted           Start with microphone muted");
     println!("      --no-trim             Disable silence trimming (trimming is on by default)");
     println!();
@@ -228,7 +228,7 @@ fn print_usage() {
     println!("  audio-rec record -o C:\\recordings\\meeting.wav");
     println!("  audio-rec record -o meeting.m4a -d 60 --mic-muted");
     println!("  audio-rec record --no-trim -q standard");
-    println!("  audio-rec record -i 0 -O 1          # Use specific input/output devices");
+    println!("  audio-rec record -id 0 -od 1        # Use specific input/output devices");
     println!("  audio-rec record --input-device 0    # Use specific microphone");
     println!("  audio-rec devices                    # List available audio devices");
     println!("  audio-rec stop");
@@ -260,7 +260,7 @@ mod tests {
             "0".into(),
         ];
         assert_eq!(
-            parse_flag_value(&args, "--input-device", Some("-i")),
+            parse_flag_value(&args, "--input-device", Some("-id")),
             Some("0".to_string())
         );
     }
@@ -270,25 +270,25 @@ mod tests {
         let args: Vec<String> = vec![
             "audio-rec".into(),
             "record".into(),
-            "-i".into(),
+            "-id".into(),
             "2".into(),
         ];
         assert_eq!(
-            parse_flag_value(&args, "--input-device", Some("-i")),
+            parse_flag_value(&args, "--input-device", Some("-id")),
             Some("2".to_string())
         );
     }
 
     #[test]
-    fn test_parse_flag_value_output_device_capital_o() {
+    fn test_parse_flag_value_output_device_short() {
         let args: Vec<String> = vec![
             "audio-rec".into(),
             "record".into(),
-            "-O".into(),
+            "-od".into(),
             "1".into(),
         ];
         assert_eq!(
-            parse_flag_value(&args, "--output-device", Some("-O")),
+            parse_flag_value(&args, "--output-device", Some("-od")),
             Some("1".to_string())
         );
     }
@@ -297,19 +297,19 @@ mod tests {
     fn test_parse_flag_value_missing_returns_none() {
         let args: Vec<String> = vec!["audio-rec".into(), "record".into()];
         assert_eq!(
-            parse_flag_value(&args, "--input-device", Some("-i")),
+            parse_flag_value(&args, "--input-device", Some("-id")),
             None
         );
     }
 
     #[test]
-    fn test_parse_flag_value_no_conflict_between_o_and_capital_o() {
+    fn test_parse_flag_value_no_conflict_between_o_and_od() {
         let args: Vec<String> = vec![
             "audio-rec".into(),
             "record".into(),
             "-o".into(),
             "output.wav".into(),
-            "-O".into(),
+            "-od".into(),
             "1".into(),
         ];
         // -o should match --output, not --output-device
@@ -317,9 +317,9 @@ mod tests {
             parse_flag_value(&args, "--output", Some("-o")),
             Some("output.wav".to_string())
         );
-        // -O should match --output-device
+        // -od should match --output-device
         assert_eq!(
-            parse_flag_value(&args, "--output-device", Some("-O")),
+            parse_flag_value(&args, "--output-device", Some("-od")),
             Some("1".to_string())
         );
     }
@@ -329,17 +329,17 @@ mod tests {
         let args: Vec<String> = vec![
             "audio-rec".into(),
             "record".into(),
-            "-i".into(),
+            "-id".into(),
             "0".into(),
-            "-O".into(),
+            "-od".into(),
             "1".into(),
         ];
         assert_eq!(
-            parse_flag_value(&args, "--input-device", Some("-i")),
+            parse_flag_value(&args, "--input-device", Some("-id")),
             Some("0".to_string())
         );
         assert_eq!(
-            parse_flag_value(&args, "--output-device", Some("-O")),
+            parse_flag_value(&args, "--output-device", Some("-od")),
             Some("1".to_string())
         );
     }

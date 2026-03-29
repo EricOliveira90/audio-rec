@@ -73,12 +73,10 @@ audio-rec record [options]
 | `--duration <secs>` | `-d` | Recording duration in seconds | Indefinite (until `stop`) |
 | `--format <wav\|m4a>` | `-f` | Audio format | `wav` (or inferred from `--output` extension) |
 | `--quality <level>` | `-q` | Quality preset: `quick`, `standard`, `professional`, `high` | `professional` |
-| `--input-device <idx>` | `-i` | Input device index (microphone). Use `devices` to list. | System default |
-| `--output-device <idx>` | `-O` | Output device index (loopback). Use `devices` to list. | System default |
+| `--input-device <idx>` | `-id` | Input device index (microphone). Use `devices` to list. | System default |
+| `--output-device <idx>` | `-od` | Output device index (loopback). Use `devices` to list. | System default |
 | `--mic-muted` | | Start with microphone muted | Off |
 | `--no-trim` | | Disable automatic silence trimming | Trimming ON |
-
-> **Note:** The output device flag uses capital `-O` to avoid conflict with `-o` (output file path).
 
 **Examples:**
 
@@ -102,7 +100,7 @@ audio-rec record --no-trim -d 60
 audio-rec record -q quick -f m4a -d 120
 
 # Record using specific input and output devices
-audio-rec record -i 0 -O 1
+audio-rec record -id 0 -od 1
 
 # Record using a specific microphone
 audio-rec record --input-device 1
