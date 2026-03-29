@@ -26,15 +26,33 @@ cargo build --release
 
 The binary will be at `target/release/audio-rec.exe`.
 
+### Running from the Project Folder
+
+```bash
+cargo run --release -- record
+cargo run --release -- stop
+cargo run --release -- mute
+```
+
 ### Install Globally
 
-To make `audio-rec` available from any folder:
+To make `audio-rec` available as a command from any folder:
 
 ```bash
 cargo install --path cli
 ```
 
 This installs `audio-rec.exe` to `~/.cargo/bin/` which is already in your PATH if you have Rust installed.
+
+### Update Global Install
+
+After pulling new changes or making local modifications, re-run the install command to update the global binary:
+
+```bash
+cargo install --path cli
+```
+
+This will rebuild and replace the existing `audio-rec.exe` in `~/.cargo/bin/`.
 
 ## Commands
 
@@ -124,23 +142,22 @@ All stdout output follows a structured JSON protocol — one JSON object per lin
 
 - `duration`: `-1` means indefinite, positive number means fixed seconds
 
-#### `progress` — Periodic status update (every 1 second)
+#### `audio_state` — Audio state changed
+
+Emitted only when audio detection or mute state changes (not periodically). This keeps stdout quiet during normal recording.
 
 ```json
 {
-  "type": "progress",
+  "type": "audio_state",
   "session_id": "rec-20260320_114500",
-  "elapsed": 15,
-  "duration": 0,
-  "progress": 0,
-  "is_mic_muted": false,
   "loopback_has_audio": true,
-  "mic_has_audio": true
+  "mic_has_audio": false,
+  "is_mic_muted": false
 }
 ```
 
-- `duration`: `0` means indefinite
-- `progress`: `0` for indefinite recordings, `0-100` for timed recordings
+- Emitted when `loopback_has_audio`, `mic_has_audio`, or `is_mic_muted` changes
+- Not emitted every second — only on actual state transitions
 
 #### `muted` — Microphone mute state changed
 
@@ -225,15 +242,18 @@ proc = subprocess.Popen(
     text=True
 )
 
-# Read events from stdout
+# Read events from stdout (only emitted on state changes, not every second)
 for line in proc.stdout:
     event = json.loads(line.strip())
     
     if event["type"] == "started":
         print(f"Recording started: {event['session_id']}")
     
-    elif event["type"] == "progress":
-        print(f"Elapsed: {event['elapsed']}s")
+    elif event["type"] == "audio_state":
+        print(f"Audio state changed - System: {event['loopback_has_audio']}, Mic: {event['mic_has_audio']}, Muted: {event['is_mic_muted']}")
+    
+    elif event["type"] == "muted":
+        print(f"Mic muted: {event['is_muted']}")
     
     elif event["type"] == "completed":
         print(f"Done! File saved to: {event['file_path']}")
@@ -286,7 +306,7 @@ audio-recorder-manager-efo/
 
 1. **Startup**: CLI parses flags, checks FFmpeg availability, creates session
 2. **Recording**: WASAPI captures system audio + mic in parallel threads, writes temp WAV files
-3. **Status loop**: Every 1s — checks signal files (.stop, .mute, .cancel), emits progress JSON, updates status file
+3. **Signal check loop**: Every 1s — checks signal files (.stop, .mute, .cancel) and detects audio state changes; emits JSON events only when state changes (not periodically)
 4. **Stop**: Stops WASAPI recorders, waits for temp files to stabilize
 5. **Merge**: FFmpeg merges loopback + mic into stereo (4 scenarios based on which channels have audio)
 6. **Trim**: FFmpeg `silenceremove` filter trims leading/trailing silence, caps internal gaps at 2s

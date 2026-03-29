@@ -224,10 +224,15 @@ async fn record_worker(
             processing_speed: None,
         })?;
 
-        // Update status every second
-        let update_interval = config.status_update_interval;
+        // Track previous state for change detection (only emit events on state changes)
+        let mut prev_loopback_has_audio = loopback_recorder.has_audio_detected();
+        let mut prev_mic_has_audio = mic_recorder.as_ref().map(|m| m.has_audio_detected());
+        let mut prev_mic_muted = is_mic_muted.load(Ordering::Relaxed);
+
+        // Check for signals and state changes every second
+        let check_interval = config.signal_check_interval;
         loop {
-            tokio::time::sleep(update_interval).await;
+            tokio::time::sleep(check_interval).await;
 
             let elapsed = start_time.elapsed().as_secs();
 
@@ -314,85 +319,63 @@ async fn record_worker(
                 }
             }
 
-            // Calculate progress
-            let progress = if effective_duration > 0 {
-                ((elapsed as f64 / effective_duration as f64) * 100.0).min(100.0) as u8
-            } else {
-                0 // Indefinite mode — no progress percentage
-            };
+            // Detect state changes and emit events only when something changes
+            let cur_loopback_has_audio = loopback_recorder.has_audio_detected();
+            let cur_mic_has_audio = mic_recorder.as_ref().map(|m| m.has_audio_detected());
+            let cur_mic_muted = is_mic_muted.load(Ordering::Relaxed);
 
-            // Emit progress event
-            emit_event(&json!({
-                "type": "progress",
-                "session_id": session.id.as_str(),
-                "elapsed": elapsed,
-                "duration": effective_duration,
-                "progress": progress,
-                "is_mic_muted": is_mic_muted.load(Ordering::Relaxed),
-                "loopback_has_audio": loopback_recorder.has_audio_detected(),
-                "mic_has_audio": mic_recorder.as_ref().map(|m| m.has_audio_detected()),
-            }));
+            let state_changed = cur_loopback_has_audio != prev_loopback_has_audio
+                || cur_mic_has_audio != prev_mic_has_audio
+                || cur_mic_muted != prev_mic_muted;
 
-            // Print progress to terminal (dual-channel format)
-            if let Some(ref mic) = mic_recorder {
-                let mute_indicator = if is_mic_muted.load(Ordering::Relaxed) {
-                    "MUTED"
-                } else if mic.has_audio_detected() {
-                    "Audio"
+            if state_changed {
+                emit_event(&json!({
+                    "type": "audio_state",
+                    "session_id": session.id.as_str(),
+                    "loopback_has_audio": cur_loopback_has_audio,
+                    "mic_has_audio": cur_mic_has_audio,
+                    "is_mic_muted": cur_mic_muted,
+                }));
+
+                // Calculate progress for status file
+                let progress = if effective_duration > 0 {
+                    ((elapsed as f64 / effective_duration as f64) * 100.0).min(100.0) as u8
                 } else {
-                    "Silent"
+                    0
                 };
-                output.prefixed(
-                    "Recording",
-                    &format!(
-                        "Elapsed: {}s | Loopback: {} frames ({}) | Mic: {} frames ({})",
-                        elapsed,
-                        loopback_recorder.get_frames_captured(),
-                        if loopback_recorder.has_audio_detected() { "Audio" } else { "Silent" },
-                        mic.get_frames_captured(),
-                        mute_indicator
-                    )
-                );
-            } else {
-                output.prefixed(
-                    "Recording",
-                    &format!(
-                        "Elapsed: {}s | Loopback: {} frames ({})",
-                        elapsed,
-                        loopback_recorder.get_frames_captured(),
-                        if loopback_recorder.has_audio_detected() { "Audio" } else { "Silent" }
-                    )
-                );
-            }
 
-            // Update status file
-            observer.on_progress(RecordingStatus {
-                session_id: session.id.as_str().to_string(),
-                filename: session.temp_filename(),
-                duration: effective_duration,
-                elapsed,
-                progress,
-                quality: session.quality.name.clone(),
-                device: if mic_recorder.is_some() {
-                    "Dual-Channel (System + Microphone)".to_string()
-                } else {
-                    "System Audio Only (WASAPI Loopback)".to_string()
-                },
-                sample_rate: loopback_recorder.get_sample_rate(),
-                channels: 2, // Always stereo output
-                frames_captured: loopback_recorder.get_frames_captured(),
-                has_audio: loopback_recorder.has_audio_detected(),
-                status: "recording".to_string(),
-                // Per-channel data
-                loopback_frames: Some(loopback_recorder.get_frames_captured()),
-                loopback_has_audio: Some(loopback_recorder.has_audio_detected()),
-                mic_frames: mic_recorder.as_ref().map(|m| m.get_frames_captured()),
-                mic_has_audio: mic_recorder.as_ref().map(|m| m.has_audio_detected()),
-                is_mic_muted: Some(is_mic_muted.load(Ordering::Relaxed)),
-                // FFmpeg progress (not applicable during recording)
-                ffmpeg_progress: None,
-                processing_speed: None,
-            })?;
+                // Update status file only on state change
+                observer.on_progress(RecordingStatus {
+                    session_id: session.id.as_str().to_string(),
+                    filename: session.temp_filename(),
+                    duration: effective_duration,
+                    elapsed,
+                    progress,
+                    quality: session.quality.name.clone(),
+                    device: if mic_recorder.is_some() {
+                        "Dual-Channel (System + Microphone)".to_string()
+                    } else {
+                        "System Audio Only (WASAPI Loopback)".to_string()
+                    },
+                    sample_rate: loopback_recorder.get_sample_rate(),
+                    channels: 2,
+                    frames_captured: loopback_recorder.get_frames_captured(),
+                    has_audio: cur_loopback_has_audio,
+                    status: "recording".to_string(),
+                    loopback_frames: Some(loopback_recorder.get_frames_captured()),
+                    loopback_has_audio: Some(cur_loopback_has_audio),
+                    mic_frames: mic_recorder.as_ref().map(|m| m.get_frames_captured()),
+                    mic_has_audio: cur_mic_has_audio,
+                    is_mic_muted: Some(cur_mic_muted),
+                    ffmpeg_progress: None,
+                    processing_speed: None,
+                })?;
+
+                // Update tracked state
+                prev_loopback_has_audio = cur_loopback_has_audio;
+                prev_mic_has_audio = cur_mic_has_audio;
+                prev_mic_muted = cur_mic_muted;
+            }
         }
 
         // Stop both recorders

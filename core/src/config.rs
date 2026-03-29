@@ -12,7 +12,7 @@ pub struct RecorderConfig {
     pub status_dir: PathBuf,
     pub signals_dir: PathBuf,
     #[serde(skip)]
-    pub status_update_interval: Duration,
+    pub signal_check_interval: Duration,
     #[serde(skip)]
     pub file_write_delay_ms: u64,
 }
@@ -66,7 +66,7 @@ impl RecorderConfig {
             status_dir: storage_dir.join("status"),
             signals_dir: storage_dir.join("signals"),
             storage_dir,
-            status_update_interval: Duration::from_secs(1),
+            signal_check_interval: Duration::from_secs(1),
             file_write_delay_ms: 500,
         }
     }
@@ -118,7 +118,7 @@ impl RecorderConfig {
         let mut config = Self::from_storage_dir(storage_dir);
 
         // Set non-serialized fields
-        config.status_update_interval = Duration::from_secs(1);
+        config.signal_check_interval = Duration::from_secs(1);
         config.file_write_delay_ms = 500;
 
         Ok(config)

@@ -194,9 +194,9 @@ fn print_usage() {
     println!("  audio-rec mute");
     println!();
     println!("JSON PROTOCOL (stdout):");
-    println!("  All output is JSON, one object per line:");
+    println!("  All output is JSON, one object per line (events emitted only on state changes):");
     println!("  {{\"type\": \"started\", \"session_id\": \"...\", \"file_path\": \"...\"}}");
-    println!("  {{\"type\": \"progress\", \"elapsed\": 15, \"duration\": 0}}");
+    println!("  {{\"type\": \"audio_state\", \"loopback_has_audio\": true, \"mic_has_audio\": false, \"is_mic_muted\": false}}");
     println!("  {{\"type\": \"muted\", \"is_muted\": true}}");
     println!("  {{\"type\": \"completed\", \"file_path\": \"...\", \"file_size_mb\": \"2.34\"}}");
     println!("  {{\"type\": \"error\", \"message\": \"...\"}}");
