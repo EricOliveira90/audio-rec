@@ -242,7 +242,7 @@ async fn record_worker(
         let is_mic_muted = Arc::new(AtomicBool::new(mic_muted));
 
         // Initialize microphone recorder with matched sample rate and mute flag
-        let mic_recorder = match if let Some(idx) = input_device_index {
+        let mut mic_recorder = match if let Some(idx) = input_device_index {
             tracing::info!("Using input device index {} for microphone recording", idx);
             WasapiMicrophoneRecorder::with_device_index(
                 mic_temp.clone(),
@@ -328,8 +328,9 @@ async fn record_worker(
                 let _ = std::fs::remove_file(cancel_signal);
 
                 // Stop both recorders
+                let mut loopback_recorder = loopback_recorder;
                 loopback_recorder.stop()?;
-                if let Some(ref mic) = mic_recorder {
+                if let Some(mut mic) = mic_recorder.take() {
                     mic.stop()?;
                 }
 
@@ -457,8 +458,9 @@ async fn record_worker(
         }
 
         // Stop both recorders
+        let mut loopback_recorder = loopback_recorder;
         loopback_recorder.stop()?;
-        if let Some(ref mic) = mic_recorder {
+        if let Some(mut mic) = mic_recorder.take() {
             mic.stop()?;
         }
 

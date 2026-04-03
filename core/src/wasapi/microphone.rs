@@ -1,5 +1,7 @@
 //! Windows WASAPI microphone recording implementation
 //!
+//! Thin wrapper around the shared capture engine configured for microphone recording.
+//!
 //! # Safety
 //!
 //! This module uses extensive `unsafe` code to interact with the Windows Audio Session API (WASAPI).
@@ -12,6 +14,9 @@
 
 use anyhow::{Context, Result};
 use crate::audio_utils::{calculate_rms_f32, calculate_rms_i16};
+use crate::wasapi::capture_engine::{
+    detect_sample_format, f32_to_i16, SampleFormat, WriteErrorTracker,
+};
 use hound::{WavSpec, WavWriter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,12 +26,15 @@ use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 
 const REFTIMES_PER_SEC: i64 = 10_000_000;
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct WasapiMicrophoneRecorder {
     is_recording: Arc<AtomicBool>,
     frames_captured: Arc<AtomicU64>,
     has_audio: Arc<AtomicBool>,
     is_muted: Arc<AtomicBool>,
+    thread_handle: Option<std::thread::JoinHandle<Result<()>>>,
+    write_errors: Arc<WriteErrorTracker>,
 }
 
 impl WasapiMicrophoneRecorder {
@@ -38,26 +46,26 @@ impl WasapiMicrophoneRecorder {
         let is_recording = Arc::new(AtomicBool::new(true));
         let frames_captured = Arc::new(AtomicU64::new(0));
         let has_audio = Arc::new(AtomicBool::new(false));
+        let write_errors = Arc::new(WriteErrorTracker::new());
 
         let is_recording_clone = Arc::clone(&is_recording);
         let frames_captured_clone = Arc::clone(&frames_captured);
         let has_audio_clone = Arc::clone(&has_audio);
         let is_muted_clone = Arc::clone(&is_muted);
+        let write_errors_clone = Arc::clone(&write_errors);
 
         // Spawn recording thread that initializes its own COM
-        std::thread::spawn(move || {
-            if let Err(e) = Self::recording_thread(
+        let handle = std::thread::spawn(move || {
+            Self::recording_thread(
                 filepath,
                 target_sample_rate,
                 is_recording_clone,
                 frames_captured_clone,
                 has_audio_clone,
                 is_muted_clone,
+                write_errors_clone,
                 device_index,
-            ) {
-                tracing::error!("Microphone recording thread error: {}", e);
-                tracing::error!("Error chain: {:?}", e);
-            }
+            )
         });
 
         Ok(Self {
@@ -65,6 +73,8 @@ impl WasapiMicrophoneRecorder {
             frames_captured,
             has_audio,
             is_muted,
+            thread_handle: Some(handle),
+            write_errors,
         })
     }
 
@@ -75,6 +85,7 @@ impl WasapiMicrophoneRecorder {
         frames_captured: Arc<AtomicU64>,
         has_audio: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
+        write_errors: Arc<WriteErrorTracker>,
         device_index: Option<u32>,
     ) -> Result<()> {
         unsafe {
@@ -108,12 +119,16 @@ impl WasapiMicrophoneRecorder {
             let bits_per_sample = native_wf.wBitsPerSample;
             let format_tag = native_wf.wFormatTag;
 
+            // Use shared format detection
+            let sample_format = detect_sample_format(format_tag, bits_per_sample);
+
             tracing::info!(
-                "WASAPI Microphone native format: {} Hz, {} channels, {} bits, tag: {}",
+                "WASAPI Microphone native format: {} Hz, {} channels, {} bits, tag: 0x{:X}, detected: {:?}",
                 native_sample_rate,
                 channels,
                 bits_per_sample,
-                format_tag
+                format_tag,
+                sample_format
             );
 
             // IMPORTANT: Use native format to avoid AUDCLNT_E_UNSUPPORTED_FORMAT errors.
@@ -141,10 +156,6 @@ impl WasapiMicrophoneRecorder {
             // Record at native sample rate - FFmpeg will resample during merge
             let sample_rate = native_sample_rate;
 
-            // Detect if using float format
-            // Format tag 3 = WAVE_FORMAT_IEEE_FLOAT, 0xFFFE = WAVE_FORMAT_EXTENSIBLE (check subformat)
-            let is_float = format_tag == 3 || (format_tag == 0xFFFE && bits_per_sample == 32);
-
             // Get capture client
             tracing::info!("Getting capture client service...");
             let capture_client: IAudioCaptureClient = audio_client.GetService()?;
@@ -169,11 +180,10 @@ impl WasapiMicrophoneRecorder {
             tracing::info!("Audio client started successfully");
 
             tracing::info!(
-                "Recording microphone: {} Hz, {} channels, {} bits, {} format",
+                "Recording microphone: {} Hz, {} channels, {:?} format",
                 sample_rate,
                 channels,
-                bits_per_sample,
-                if is_float { "float" } else { "int" }
+                sample_format
             );
             tracing::info!("Microphone audio client started, entering recording loop...");
 
@@ -214,88 +224,85 @@ impl WasapiMicrophoneRecorder {
 
                     if num_frames > 0 {
                         frames_captured.fetch_add(1, Ordering::Relaxed);
+                        let total_samples = (num_frames * channels as u32) as usize;
 
                         // Check if buffer contains silence (AUDCLNT_BUFFERFLAGS_SILENT = 0x2)
                         let is_silent = (flags & 0x2) != 0;
 
-                        if is_muted.load(Ordering::Relaxed) {
-                            // Write silence when muted
+                        if is_muted.load(Ordering::Relaxed) || is_silent {
+                            // Write silence when muted or buffer is silent
                             if let Some(writer) = writer.as_mut() {
-                                for _ in 0..(num_frames * channels as u32) {
-                                    let _ = writer.write_sample(0i16);
-                                }
-                            }
-                        } else if is_silent {
-                            // Write silence for the number of frames
-                            if let Some(writer) = writer.as_mut() {
-                                for _ in 0..(num_frames * channels as u32) {
-                                    let _ = writer.write_sample(0i16);
+                                for _ in 0..total_samples {
+                                    if let Err(e) = writer.write_sample(0i16) {
+                                        write_errors.record_error(&e);
+                                    }
                                 }
                             }
                         } else {
-                            // Process audio based on native format
-                            if is_float {
-                                // Process 32-bit float samples
-                                let samples = std::slice::from_raw_parts(
-                                    buffer as *const f32,
-                                    (num_frames * channels as u32) as usize,
-                                );
+                            match sample_format {
+                                SampleFormat::Float32 => {
+                                    let samples = std::slice::from_raw_parts(
+                                        buffer as *const f32,
+                                        total_samples,
+                                    );
 
-                                // Detect audio
-                                if !has_audio.load(Ordering::Relaxed) {
-                                    let rms = calculate_rms_f32(samples);
-                                    if rms > 0.01 {
-                                        has_audio.store(true, Ordering::Relaxed);
-                                        tracing::info!(
-                                            "Microphone audio detected! Level: {:.4}",
-                                            rms
-                                        );
+                                    if !has_audio.load(Ordering::Relaxed) {
+                                        let rms = calculate_rms_f32(samples);
+                                        if rms > 0.01 {
+                                            has_audio.store(true, Ordering::Relaxed);
+                                            tracing::info!(
+                                                "Microphone audio detected! Level: {:.4}",
+                                                rms
+                                            );
+                                        }
+                                    }
+
+                                    if let Some(writer) = writer.as_mut() {
+                                        for &sample in samples {
+                                            let sample_i16 = f32_to_i16(sample);
+                                            if let Err(e) = writer.write_sample(sample_i16) {
+                                                write_errors.record_error(&e);
+                                            }
+                                        }
                                     }
                                 }
+                                SampleFormat::Int16 => {
+                                    let samples = std::slice::from_raw_parts(
+                                        buffer as *const i16,
+                                        total_samples,
+                                    );
 
-                                // Convert and write to 16-bit
-                                if let Some(writer) = writer.as_mut() {
-                                    for &sample in samples {
-                                        let sample_i16 =
-                                            (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-                                        let _ = writer.write_sample(sample_i16);
+                                    if !has_audio.load(Ordering::Relaxed) {
+                                        let rms = calculate_rms_i16(samples);
+                                        if rms > 327.0 {
+                                            has_audio.store(true, Ordering::Relaxed);
+                                            tracing::info!(
+                                                "Microphone audio detected! Level: {:.4}",
+                                                rms / 32767.0
+                                            );
+                                        }
+                                    }
+
+                                    if let Some(writer) = writer.as_mut() {
+                                        for &sample in samples {
+                                            if let Err(e) = writer.write_sample(sample) {
+                                                write_errors.record_error(&e);
+                                            }
+                                        }
                                     }
                                 }
-                            } else if bits_per_sample == 16 {
-                                // Process 16-bit int samples
-                                let samples = std::slice::from_raw_parts(
-                                    buffer as *const i16,
-                                    (num_frames * channels as u32) as usize,
-                                );
-
-                                // Detect audio
-                                if !has_audio.load(Ordering::Relaxed) {
-                                    let rms = calculate_rms_i16(samples);
-                                    if rms > 327.0 {
-                                        // 0.01 * 32767
-                                        has_audio.store(true, Ordering::Relaxed);
-                                        tracing::info!(
-                                            "Microphone audio detected! Level: {:.4}",
-                                            rms / 32767.0
-                                        );
-                                    }
-                                }
-
-                                // Write directly
-                                if let Some(writer) = writer.as_mut() {
-                                    for &sample in samples {
-                                        let _ = writer.write_sample(sample);
-                                    }
-                                }
-                            } else {
-                                // Unsupported format - write silence
-                                tracing::warn!(
-                                    "Unsupported audio format: {} bits, writing silence",
-                                    bits_per_sample
-                                );
-                                if let Some(writer) = writer.as_mut() {
-                                    for _ in 0..(num_frames * channels as u32) {
-                                        let _ = writer.write_sample(0i16);
+                                SampleFormat::Int32 | SampleFormat::Unsupported => {
+                                    // Write silence for unsupported or i32 mic formats
+                                    tracing::warn!(
+                                        "Unsupported microphone format: {:?}, writing silence",
+                                        sample_format
+                                    );
+                                    if let Some(writer) = writer.as_mut() {
+                                        for _ in 0..total_samples {
+                                            if let Err(e) = writer.write_sample(0i16) {
+                                                write_errors.record_error(&e);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -320,6 +327,10 @@ impl WasapiMicrophoneRecorder {
                 writer.finalize()?;
             }
 
+            if write_errors.had_errors() {
+                tracing::warn!("Some audio samples could not be written during microphone recording");
+            }
+
             // Native format was already freed after Initialize()
 
             CoUninitialize();
@@ -340,11 +351,37 @@ impl WasapiMicrophoneRecorder {
         self.is_muted.load(Ordering::Relaxed)
     }
 
-    pub fn stop(&self) -> Result<()> {
+    pub fn stop(&mut self) -> Result<()> {
         self.is_recording.store(false, Ordering::Relaxed);
 
-        // Wait a moment for recording thread to finish
-        std::thread::sleep(Duration::from_millis(1000));
+        // Use JoinHandle with timeout instead of thread::sleep hack
+        if let Some(handle) = self.thread_handle.take() {
+            let start = std::time::Instant::now();
+            loop {
+                if handle.is_finished() {
+                    match handle.join() {
+                        Ok(result) => {
+                            if let Err(e) = result {
+                                tracing::error!("Microphone recording thread error: {}", e);
+                            }
+                        }
+                        Err(_) => {
+                            tracing::error!("Microphone recording thread panicked");
+                        }
+                    }
+                    break;
+                }
+                if start.elapsed() >= STOP_TIMEOUT {
+                    tracing::warn!("Microphone recording thread did not finish within {:?}, continuing", STOP_TIMEOUT);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        if self.write_errors.had_errors() {
+            tracing::warn!("Some audio samples could not be written during microphone recording");
+        }
 
         Ok(())
     }
