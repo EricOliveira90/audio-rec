@@ -468,6 +468,13 @@ async fn record_worker(
             }
         }
 
+        // Save audio detection state BEFORE stopping/taking recorders
+        // (mic_recorder.take() sets it to None, making has_audio_detected() inaccessible)
+        let final_loopback_has_audio = loopback_recorder.has_audio_detected();
+        let final_mic_has_audio = mic_recorder.as_ref()
+            .map(|m| m.has_audio_detected())
+            .unwrap_or(false);
+
         // Stop both recorders
         let mut loopback_recorder = loopback_recorder;
         loopback_recorder.stop()?;
@@ -502,8 +509,9 @@ async fn record_worker(
         };
 
         // Stage 1: Analyzing Audio
-        let loopback_has_audio = loopback_recorder.has_audio_detected();
-        let mic_has_audio = mic_recorder.as_ref().map(|m| m.has_audio_detected()).unwrap_or(false);
+        // Use the saved values from before stop/take (mic_recorder is None after take())
+        let loopback_has_audio = final_loopback_has_audio;
+        let mic_has_audio = final_mic_has_audio;
 
         let analysis_message = if loopback_has_audio && mic_has_audio {
             "Detected system audio and microphone"
@@ -537,8 +545,9 @@ async fn record_worker(
 
         // Merge audio channels (and encode to M4A if requested)
         {
-            let loopback_has_audio_flag = loopback_recorder.has_audio_detected();
-            let mic_has_audio_flag = mic_recorder.as_ref().map(|m| m.has_audio_detected()).unwrap_or(false);
+            // Use saved values (mic_recorder was already taken above)
+            let loopback_has_audio_flag = final_loopback_has_audio;
+            let mic_has_audio_flag = final_mic_has_audio;
 
             async {
                 if matches!(session.format, AudioFormat::M4a) {
@@ -549,12 +558,6 @@ async fn record_worker(
 
                 // Small delay to ensure status file was written before merge starts
                 tokio::time::sleep(Duration::from_millis(200)).await;
-
-                // Get audio detection flags
-                let loopback_has_audio = loopback_recorder.has_audio_detected();
-                let mic_has_audio = mic_recorder.as_ref()
-                    .map(|m| m.has_audio_detected())
-                    .unwrap_or(false);
 
                 // Merge audio streams using FFmpeg
                 merge_audio_streams_smart(
