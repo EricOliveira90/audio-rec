@@ -5,8 +5,14 @@ A Rust-based command-line tool for recording system audio and microphone on Wind
 ## Features
 
 - **Dual-channel recording** — Captures system audio (WASAPI loopback) and microphone simultaneously
+- **Real-time noise suppression** — RNNoise-based neural network noise removal on microphone audio (keyboard typing, fan noise)
+- **Noise gate** — VAD-driven 6-state noise gate with smooth attack/release ramps (no clicks)
+- **Real-time limiter** — Soft limiter prevents clipping from sudden loud sounds
+- **Loudness normalization** — EBU R128 loudness normalization to -16 LUFS (configurable)
+- **Post-processing pipeline** — Discrete stages: Merge → Normalize → Limit → Trim → Finalize
 - **Device selection** — Choose specific audio input/output devices by index
 - **Device enumeration** — List all available audio devices with `audio-rec devices`
+- **Process-specific capture** — Capture audio from a specific application only (e.g., `--app Zoom.exe`)
 - **Enhanced status** — View active recording session info (elapsed time, devices, audio detection, etc.)
 - **Structured JSON protocol** — All stdout output is JSON, one object per line, for easy parsing
 - **Silence trimming** — Automatically trims leading/trailing silence and caps internal silence gaps at 2 seconds
@@ -14,6 +20,7 @@ A Rust-based command-line tool for recording system audio and microphone on Wind
 - **Custom output path** — Save recordings wherever you want
 - **Multiple formats** — WAV (lossless) and M4A (AAC compressed)
 - **File-based IPC** — Stop, cancel, and mute via signal files (no sockets needed)
+- **Zero-config quality** — All quality features ON by default, disable with `--no-*` flags
 
 ## Requirements
 
@@ -77,11 +84,19 @@ audio-rec record [options]
 | `--output-device <idx>` | `-od` | Output device index (loopback). Use `devices` to list. | System default |
 | `--mic-muted` | | Start with microphone muted | Off |
 | `--no-trim` | | Disable automatic silence trimming | Trimming ON |
+| `--no-normalize` | | Disable loudness normalization | Normalization ON |
+| `--no-limiter` | | Disable soft audio limiter | Limiter ON |
+| `--no-denoise` | | Disable real-time noise suppression | Denoise ON |
+| `--no-noise-gate` | | Disable noise gate | Gate ON |
+| `--target-loudness <LUFS>` | | Target loudness level (e.g., `-23` for broadcast) | `-16` (streaming) |
+| `--gate-threshold <val>` | | Noise gate threshold (VAD probability 0.0-1.0) | `0.5` |
+| `--app <name>` | | Capture audio from specific process (e.g., `Zoom.exe`) | All system audio |
+| `--app-window <title>` | | Capture audio from specific window title | All system audio |
 
 **Examples:**
 
 ```bash
-# Record indefinitely, save to current directory
+# Record indefinitely with all quality features (default)
 audio-rec record
 
 # Record for 30 seconds
@@ -93,17 +108,20 @@ audio-rec record -o C:\recordings\meeting.wav
 # Record as M4A with mic muted
 audio-rec record -o standup.m4a --mic-muted
 
-# Record without silence trimming
-audio-rec record --no-trim -d 60
+# Record without any audio processing (raw capture)
+audio-rec record --no-normalize --no-limiter --no-denoise --no-noise-gate --no-trim
 
-# Quick quality, standard format
-audio-rec record -q quick -f m4a -d 120
+# Record with broadcast loudness standard
+audio-rec record --target-loudness -23
+
+# Record only Zoom audio (no Slack notifications, no Spotify)
+audio-rec record --app Zoom.exe
+
+# Record with sensitive noise gate (catches quieter speech)
+audio-rec record --gate-threshold 0.3
 
 # Record using specific input and output devices
 audio-rec record -id 0 -od 1
-
-# Record using a specific microphone
-audio-rec record --input-device 1
 ```
 
 ### `stop` — Stop Recording
@@ -112,7 +130,7 @@ audio-rec record --input-device 1
 audio-rec stop [session_id]
 ```
 
-Stops the active recording and triggers post-processing (merge, encode, trim). If no `session_id` is provided, stops the most recent active session.
+Stops the active recording and triggers post-processing (merge, normalize, limit, trim). If no `session_id` is provided, stops the most recent active session.
 
 ### `mute` — Toggle Microphone Mute
 
@@ -177,11 +195,41 @@ Shows information about the active recording session, including elapsed time, de
 }
 ```
 
-**Example output (no active recording):**
+## Audio Quality Pipeline
 
-```json
-{"type": "status", "active": false, "message": "No active recording session found"}
+All quality features are **ON by default** for zero-config best quality. Disable any feature with `--no-*` flags.
+
+### Real-Time Processing (Microphone)
+
+Applied in real-time during recording, before samples are written to WAV:
+
 ```
+Mic samples → Resample to 48kHz → RNNoise (denoise + VAD) → Noise Gate (VAD-driven) → Limiter → Resample to native → WAV
+```
+
+| Stage | What it does | Disable flag |
+|-------|-------------|--------------|
+| **RNNoise** | Neural network noise suppression — removes keyboard typing, fan noise, background hum | `--no-denoise` |
+| **Noise Gate** | 6-state machine (Closed→Opening→Open→Holding→Closing→Closed) with smooth ramps. VAD-driven when RNNoise active, dB threshold when disabled | `--no-noise-gate` |
+| **Limiter** | Soft limiter at 0.95 threshold with 1ms attack — prevents clipping from sudden loud sounds | `--no-limiter` |
+
+### Post-Processing Pipeline
+
+Applied after recording stops, before the final file is saved:
+
+```
+Merge → Normalize → Limiter → Trim → Finalize
+```
+
+| Stage | What it does | Disable flag |
+|-------|-------------|--------------|
+| **Merge** | Combines loopback + mic into stereo (4 scenarios based on which channels have audio) | Always active |
+| **Normalize** | EBU R128 loudness normalization to -16 LUFS (two-pass for WAV, single-pass for M4A) | `--no-normalize` |
+| **Limiter** | FFmpeg `alimiter` filter for post-processing limiting | `--no-limiter` |
+| **Trim** | Removes leading/trailing silence, caps internal gaps at 2s | `--no-trim` |
+| **Finalize** | Copies to final output path | Always active |
+
+Each stage emits a JSON `processing` event so calling tools can show accurate progress.
 
 ## JSON Protocol (stdout)
 
@@ -225,9 +273,6 @@ Emitted only when audio detection or mute state changes (not periodically). This
 }
 ```
 
-- Emitted when `loopback_has_audio`, `mic_has_audio`, or `is_mic_muted` changes
-- Not emitted every second — only on actual state transitions
-
 #### `muted` — Microphone mute state changed
 
 ```json
@@ -244,8 +289,8 @@ Emitted only when audio detection or mute state changes (not periodically). This
 {
   "type": "processing",
   "session_id": "rec-20260320_114500",
-  "message": "Trimming silence",
-  "elapsed_secs": 30
+  "message": "Normalizing loudness",
+  "stage": "normalizing"
 }
 ```
 
@@ -303,7 +348,7 @@ Here's how another tool (e.g., a Python script) would use this:
 import subprocess
 import json
 
-# Start recording
+# Start recording with all quality features (default)
 proc = subprocess.Popen(
     ["audio-rec", "record", "-o", "meeting.wav"],
     stdout=subprocess.PIPE,
@@ -319,14 +364,13 @@ for line in proc.stdout:
         print(f"Recording started: {event['session_id']}")
     
     elif event["type"] == "audio_state":
-        print(f"Audio state changed - System: {event['loopback_has_audio']}, Mic: {event['mic_has_audio']}, Muted: {event['is_mic_muted']}")
+        print(f"Audio: System={event['loopback_has_audio']}, Mic={event['mic_has_audio']}")
     
-    elif event["type"] == "muted":
-        print(f"Mic muted: {event['is_muted']}")
+    elif event["type"] == "processing":
+        print(f"Processing: {event['message']}")
     
     elif event["type"] == "completed":
-        print(f"Done! File saved to: {event['file_path']}")
-        print(f"Size: {event['file_size_mb']} MB")
+        print(f"Done! File: {event['file_path']} ({event['file_size_mb']} MB)")
         break
 
 # To stop early (from another process/thread):
@@ -339,7 +383,7 @@ for line in proc.stdout:
 ## Architecture
 
 ```
-audio-recorder-manager-efo/
+audio-rec/
 ├── Cargo.toml                    # Workspace root
 ├── core/                         # Library crate
 │   └── src/
@@ -347,12 +391,19 @@ audio-recorder-manager-efo/
 │       ├── audio_utils.rs        # RMS audio level detection
 │       ├── config.rs             # Storage/config management
 │       ├── domain.rs             # AudioFormat, RecordingDuration, SessionId
-│       ├── error.rs              # Error types
+│       ├── error.rs              # Error types (incl. DeviceDisconnected, ProcessNotFound, etc.)
 │       ├── ffmpeg_encoder.rs     # FFmpeg integration (merge, encode, trim, duration)
 │       ├── logging.rs            # Dual-output logging (file + terminal)
 │       ├── output.rs             # User-facing terminal output
 │       ├── recorder.rs           # Quality presets, smart audio merge (4 scenarios)
 │       ├── status.rs             # JSON status file observer
+│       ├── audio_processing/     # Real-time audio processing pipeline
+│       │   ├── noise_suppress.rs # RNNoise noise suppression + VAD + resampling
+│       │   ├── noise_gate.rs     # 6-state noise gate (VAD-driven or dB threshold)
+│       │   ├── limiter.rs        # Real-time soft limiter (0.95 threshold, 1ms attack)
+│       │   └── pipeline.rs       # Chains: RNNoise → Gate → Limiter
+│       ├── post_processing/      # Post-recording processing pipeline
+│       │   └── pipeline.rs       # Discrete stages: Merge → Normalize → Limit → Trim → Finalize
 │       ├── commands/
 │       │   ├── devices.rs        # Devices command (enumerate audio devices)
 │       │   ├── record.rs         # Record command (main recording lifecycle)
@@ -360,9 +411,10 @@ audio-recorder-manager-efo/
 │       │   ├── mute.rs           # Mute toggle command (signal file IPC)
 │       │   └── status.rs         # Status command (active session info)
 │       └── wasapi/
+│           ├── capture_engine.rs # Shared WASAPI capture logic (format detection, sample conversion)
 │           ├── device_enumeration.rs  # WASAPI device enumeration & validation
-│           ├── loopback.rs       # System audio capture (WASAPI loopback)
-│           └── microphone.rs     # Microphone capture (with mute support)
+│           ├── loopback.rs       # System audio capture (thin wrapper over capture engine)
+│           └── microphone.rs     # Microphone capture (thin wrapper with mute + audio processing)
 ├── cli/                          # Binary crate
 │   └── src/
 │       ├── main.rs               # Entry point, logging init
@@ -375,13 +427,12 @@ audio-recorder-manager-efo/
 
 ### Recording Lifecycle
 
-1. **Startup**: CLI parses flags, checks FFmpeg availability, creates session
-2. **Recording**: WASAPI captures system audio + mic in parallel threads, writes temp WAV files
-3. **Signal check loop**: Every 1s — checks signal files (.stop, .mute, .cancel) and detects audio state changes; emits JSON events only when state changes (not periodically)
-4. **Stop**: Stops WASAPI recorders, waits for temp files to stabilize
-5. **Merge**: FFmpeg merges loopback + mic into stereo (4 scenarios based on which channels have audio)
-6. **Trim**: FFmpeg `silenceremove` filter trims leading/trailing silence, caps internal gaps at 2s
-7. **Finalize**: Copies to final output path, emits `completed` JSON, cleans up temp files
+1. **Startup**: CLI parses flags (including quality features), checks FFmpeg availability, creates session
+2. **Recording**: WASAPI captures system audio + mic in parallel threads, writes temp WAV files. Mic audio passes through the real-time processing pipeline (denoise → gate → limiter)
+3. **Signal check loop**: Every 1s — checks signal files (.stop, .mute, .cancel) and detects audio state changes; emits JSON events only when state changes
+4. **Stop**: Signals capture threads via Win32 events, joins with 5s timeout (no more sleep hacks)
+5. **Post-processing pipeline**: Merge → Normalize → Limit → Trim → Finalize (each stage emits JSON events)
+6. **Finalize**: Copies to final output path, emits `completed` JSON, cleans up temp files
 
 ### Audio Merge Scenarios
 
@@ -422,17 +473,44 @@ Logs go to two places:
 
 Log level can be set with `--log-level <trace|debug|info|warn|error>` (default: `info`).
 
+## Testing
+
+The project has comprehensive test coverage with 160 tests:
+
+```bash
+cargo test
+```
+
+| Module | Tests | What's covered |
+|--------|-------|----------------|
+| `capture_engine` | 22 | Sample conversion (f32→i16, i32→i16), format detection, write error tracking |
+| `noise_suppress` | 14 | Stereo downmix/upmix, resampling, VAD output, enable/disable |
+| `noise_gate` | 12 | All 6 state transitions, hold time, attack/release ramps, VAD-driven mode |
+| `limiter` | 10 | Threshold behavior, passthrough, gain recovery, buffer processing |
+| `audio_pipeline` | 8 | Full chain, each stage independently disabled, config from flags |
+| `post_processing` | 13 | Pipeline config, stage counting, event emitter, M4A vs WAV stages |
+| `cli` | 22 | All 16 CLI flags parsed correctly, RecordOptions defaults |
+| Other modules | 59 | Domain types, audio utils, device enumeration, status, logging |
+
 ## Future Implementation Plans
 
-- [ ] **Graceful shutdown** — Handle SIGTERM/Ctrl+C to properly finalize recordings instead of leaving corrupted temp files
-- [ ] **Audio normalization** — Optional loudness normalization via FFmpeg's `loudnorm` filter after recording
+- [ ] **Graceful Ctrl+C shutdown** — Handle SIGTERM/Ctrl+C to properly finalize recordings
+- [ ] **Event-driven WASAPI capture** — Replace polling with `WaitForMultipleObjects` for lower CPU usage
+- [ ] **Silent loopback fix** — ClearBuffer silence injection to keep WASAPI stream alive during silent periods
+- [ ] **Device reconnection** — Automatic reconnection when audio devices are disconnected/reconnected
+- [ ] **Timestamp synchronization** — QPC timestamps for precise loopback/mic alignment
 - [ ] **Cross-platform support** — Linux (PulseAudio/PipeWire) and macOS (CoreAudio) recording backends
-- [x] **Device selection** — Choose specific audio input/output devices by index (`--input-device` / `--output-device`)
+- [x] **Device selection** — Choose specific audio input/output devices by index
 - [x] **Device enumeration** — List available audio devices with `audio-rec devices`
-- [x] **Enhanced status** — Show active recording session info (elapsed time, devices, audio detection, etc.)
-- [ ] **Real-time audio level monitoring** — Emit audio level (RMS/peak) in progress events for VU meter display
+- [x] **Enhanced status** — Show active recording session info
+- [x] **Real-time noise suppression** — RNNoise-based neural network noise removal
+- [x] **Noise gate** — VAD-driven 6-state noise gate with smooth ramps
+- [x] **Audio limiter** — Real-time soft limiter + post-processing limiter
+- [x] **Loudness normalization** — EBU R128 normalization pipeline stage
+- [x] **Post-processing pipeline** — Discrete stages with JSON progress events
+- [x] **Process-specific capture** — `--app` and `--app-window` flags for app-specific audio
+- [ ] **Real-time audio level monitoring** — Emit audio level (RMS/peak) in progress events
 - [ ] **Configurable silence parameters** — Expose silence threshold and max gap duration as CLI flags
-- [ ] **Pause/resume** — Pause recording without stopping (write silence during pause, or stop/restart WASAPI)
+- [ ] **Pause/resume** — Pause recording without stopping
 - [ ] **Multiple output formats** — Support FLAC, OGG, MP3 output via FFmpeg
 - [ ] **Pre-recording buffer** — Keep a rolling buffer so you never miss the start of audio
-- [ ] **Automatic gain control** — Normalize mic levels in real-time during recording
