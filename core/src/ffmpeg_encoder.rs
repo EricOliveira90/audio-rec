@@ -552,14 +552,13 @@ pub async fn trim_silence(
 
     let start_time = Instant::now();
 
-    // Create a temporary output path
-    let trimmed_path = input_path.with_extension("trimmed.tmp");
-
-    // Get the actual extension for the final output
+    // Create a temporary output path that preserves the original extension
+    // so FFmpeg can auto-detect the output format (e.g., .trimmed.wav, .trimmed.m4a)
     let extension = input_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("wav");
+    let trimmed_path = input_path.with_extension(format!("trimmed.{}", extension));
 
     tracing::info!("═══════════════════════════════════════════════════════════");
     tracing::info!("✂️  SILENCE TRIMMING STARTED");

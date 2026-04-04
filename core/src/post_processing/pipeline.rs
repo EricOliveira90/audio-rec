@@ -228,6 +228,7 @@ impl PostProcessingPipeline {
             Some(&self.session_id),
             self.observer.clone(),
             self.total_stages(),
+            0, // No start offset available in pipeline context
         )
         .await?;
 

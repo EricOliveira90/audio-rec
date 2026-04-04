@@ -468,12 +468,38 @@ async fn record_worker(
             }
         }
 
-        // Save audio detection state BEFORE stopping/taking recorders
+        // Save audio detection state and start times BEFORE stopping/taking recorders
         // (mic_recorder.take() sets it to None, making has_audio_detected() inaccessible)
         let final_loopback_has_audio = loopback_recorder.has_audio_detected();
         let final_mic_has_audio = mic_recorder.as_ref()
             .map(|m| m.has_audio_detected())
             .unwrap_or(false);
+
+        // Capture start times for desync compensation before stopping
+        let loopback_start = loopback_recorder.get_start_time();
+        let mic_start = mic_recorder.as_ref().and_then(|m| m.get_start_time());
+
+        // Compute the start offset: positive = loopback started first (common case)
+        let start_offset_ms = match (loopback_start, mic_start) {
+            (Some(lb), Some(mic)) => {
+                if lb <= mic {
+                    // Loopback started first (normal): positive offset
+                    mic.duration_since(lb).as_millis() as i64
+                } else {
+                    // Mic started first (rare): negative offset
+                    -(lb.duration_since(mic).as_millis() as i64)
+                }
+            }
+            _ => 0, // One or both start times unavailable, no compensation
+        };
+
+        if start_offset_ms != 0 {
+            tracing::info!(
+                "⏱️  Start time offset: {} ms ({})",
+                start_offset_ms.abs(),
+                if start_offset_ms > 0 { "loopback started first" } else { "mic started first" }
+            );
+        }
 
         // Stop both recorders
         let mut loopback_recorder = loopback_recorder;
@@ -559,7 +585,7 @@ async fn record_worker(
                 // Small delay to ensure status file was written before merge starts
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
-                // Merge audio streams using FFmpeg
+                // Merge audio streams using FFmpeg (with desync compensation)
                 merge_audio_streams_smart(
                     &loopback_temp,
                     &mic_temp,
@@ -571,6 +597,7 @@ async fn record_worker(
                     Some(session.id.as_str()),
                     Some(observer.clone()),
                     total_steps,
+                    start_offset_ms,
                 )
                 .await?;
 

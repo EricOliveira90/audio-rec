@@ -30,8 +30,8 @@ use crate::wasapi::capture_engine::{
 use hound::{WavSpec, WavWriter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 
@@ -43,6 +43,7 @@ pub struct WasapiLoopbackRecorder {
     frames_captured: Arc<AtomicU64>,
     has_audio: Arc<AtomicBool>,
     sample_rate: u32,
+    start_time: Arc<Mutex<Option<Instant>>>,
     thread_handle: Option<std::thread::JoinHandle<Result<()>>>,
     write_errors: Arc<WriteErrorTracker>,
 }
@@ -57,11 +58,13 @@ impl WasapiLoopbackRecorder {
         let frames_captured = Arc::new(AtomicU64::new(0));
         let has_audio = Arc::new(AtomicBool::new(false));
         let write_errors = Arc::new(WriteErrorTracker::new());
+        let start_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
         let is_recording_clone = Arc::clone(&is_recording);
         let frames_captured_clone = Arc::clone(&frames_captured);
         let has_audio_clone = Arc::clone(&has_audio);
         let write_errors_clone = Arc::clone(&write_errors);
+        let start_time_clone = Arc::clone(&start_time);
 
         // Get sample rate before spawning thread
         let sample_rate = unsafe {
@@ -98,6 +101,7 @@ impl WasapiLoopbackRecorder {
                 frames_captured_clone,
                 has_audio_clone,
                 write_errors_clone,
+                start_time_clone,
                 device_index,
             )
         });
@@ -107,6 +111,7 @@ impl WasapiLoopbackRecorder {
             frames_captured,
             has_audio,
             sample_rate,
+            start_time,
             thread_handle: Some(handle),
             write_errors,
         })
@@ -118,6 +123,7 @@ impl WasapiLoopbackRecorder {
         frames_captured: Arc<AtomicU64>,
         has_audio: Arc<AtomicBool>,
         write_errors: Arc<WriteErrorTracker>,
+        start_time: Arc<Mutex<Option<Instant>>>,
         device_index: Option<u32>,
     ) -> Result<()> {
         unsafe {
@@ -190,10 +196,26 @@ impl WasapiLoopbackRecorder {
             // Start audio client
             audio_client.Start()?;
 
+            // Record the wall-clock time when capture actually started.
+            // Used to compute the offset between loopback and mic for FFmpeg -itsoffset alignment.
+            if let Ok(mut st) = start_time.lock() {
+                *st = Some(Instant::now());
+            }
+
             tracing::info!(
                 "Recording with: {:?} format",
                 sample_format
             );
+
+            // Track total frames written to the WAV file and the recording start time.
+            // When WASAPI loopback delivers no packets (no system audio playing), we
+            // calculate how many silence frames are needed to keep the WAV duration
+            // aligned with wall-clock time. This is more accurate than writing a fixed
+            // amount per iteration, since thread::sleep(10ms) on Windows can actually
+            // sleep 15-16ms due to the default timer resolution.
+            let mut total_frames_written: u64 = 0;
+            let recording_start = Instant::now();
+            let channels_usize = channels as usize;
 
             // Recording loop
             while is_recording.load(Ordering::Relaxed) {
@@ -217,6 +239,7 @@ impl WasapiLoopbackRecorder {
 
                     if num_frames > 0 {
                         frames_captured.fetch_add(1, Ordering::Relaxed);
+                        total_frames_written += num_frames as u64;
                         let total_samples = (num_frames * channels as u32) as usize;
 
                         // Check if buffer contains silence (AUDCLNT_BUFFERFLAGS_SILENT = 0x2)
@@ -320,6 +343,28 @@ impl WasapiLoopbackRecorder {
                     }
 
                     capture_client.ReleaseBuffer(num_frames)?;
+                } else {
+                    // No packets available: no system audio is playing.
+                    // Calculate how many frames SHOULD have been written by now based on
+                    // wall-clock time, then write silence to fill the gap. This is more
+                    // accurate than a fixed per-tick amount because thread::sleep(10ms)
+                    // on Windows can actually sleep 15-16ms due to timer resolution.
+                    let elapsed_secs = recording_start.elapsed().as_secs_f64();
+                    let expected_frames = (elapsed_secs * sample_rate as f64) as u64;
+
+                    if expected_frames > total_frames_written {
+                        let gap_frames = (expected_frames - total_frames_written) as usize;
+                        let gap_samples = gap_frames * channels_usize;
+
+                        if let Some(writer) = writer.as_mut() {
+                            for _ in 0..gap_samples {
+                                if let Err(e) = writer.write_sample(0i16) {
+                                    write_errors.record_error(&e);
+                                }
+                            }
+                        }
+                        total_frames_written += gap_frames as u64;
+                    }
                 }
             }
 
@@ -351,6 +396,12 @@ impl WasapiLoopbackRecorder {
 
     pub fn get_sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Get the wall-clock time when audio_client.Start() was called.
+    /// Returns None if the recording thread hasn't started yet.
+    pub fn get_start_time(&self) -> Option<Instant> {
+        self.start_time.lock().ok().and_then(|guard| *guard)
     }
 
     pub fn stop(&mut self) -> Result<()> {

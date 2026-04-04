@@ -20,8 +20,8 @@ use crate::wasapi::capture_engine::{
 use hound::{WavSpec, WavWriter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 
@@ -33,6 +33,7 @@ pub struct WasapiMicrophoneRecorder {
     frames_captured: Arc<AtomicU64>,
     has_audio: Arc<AtomicBool>,
     is_muted: Arc<AtomicBool>,
+    start_time: Arc<Mutex<Option<Instant>>>,
     thread_handle: Option<std::thread::JoinHandle<Result<()>>>,
     write_errors: Arc<WriteErrorTracker>,
 }
@@ -47,12 +48,14 @@ impl WasapiMicrophoneRecorder {
         let frames_captured = Arc::new(AtomicU64::new(0));
         let has_audio = Arc::new(AtomicBool::new(false));
         let write_errors = Arc::new(WriteErrorTracker::new());
+        let start_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
         let is_recording_clone = Arc::clone(&is_recording);
         let frames_captured_clone = Arc::clone(&frames_captured);
         let has_audio_clone = Arc::clone(&has_audio);
         let is_muted_clone = Arc::clone(&is_muted);
         let write_errors_clone = Arc::clone(&write_errors);
+        let start_time_clone = Arc::clone(&start_time);
 
         // Spawn recording thread that initializes its own COM
         let handle = std::thread::spawn(move || {
@@ -64,6 +67,7 @@ impl WasapiMicrophoneRecorder {
                 has_audio_clone,
                 is_muted_clone,
                 write_errors_clone,
+                start_time_clone,
                 device_index,
             )
         });
@@ -73,6 +77,7 @@ impl WasapiMicrophoneRecorder {
             frames_captured,
             has_audio,
             is_muted,
+            start_time,
             thread_handle: Some(handle),
             write_errors,
         })
@@ -86,6 +91,7 @@ impl WasapiMicrophoneRecorder {
         has_audio: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
         write_errors: Arc<WriteErrorTracker>,
+        start_time: Arc<Mutex<Option<Instant>>>,
         device_index: Option<u32>,
     ) -> Result<()> {
         unsafe {
@@ -177,6 +183,13 @@ impl WasapiMicrophoneRecorder {
             // Start audio client
             tracing::info!("Starting microphone audio client...");
             audio_client.Start()?;
+
+            // Record the wall-clock time when capture actually started.
+            // Used to compute the offset between loopback and mic for FFmpeg -itsoffset alignment.
+            if let Ok(mut st) = start_time.lock() {
+                *st = Some(Instant::now());
+            }
+
             tracing::info!("Audio client started successfully");
 
             tracing::info!(
@@ -349,6 +362,12 @@ impl WasapiMicrophoneRecorder {
 
     pub fn is_muted(&self) -> bool {
         self.is_muted.load(Ordering::Relaxed)
+    }
+
+    /// Get the wall-clock time when audio_client.Start() was called.
+    /// Returns None if the recording thread hasn't started yet.
+    pub fn get_start_time(&self) -> Option<Instant> {
+        self.start_time.lock().ok().and_then(|guard| *guard)
     }
 
     pub fn stop(&mut self) -> Result<()> {

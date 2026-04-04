@@ -76,6 +76,11 @@ pub async fn convert_wav_to_m4a(wav_path: &PathBuf, m4a_path: &PathBuf) -> Resul
 /// Uses FFmpeg to handle sample rate mismatches and audio synchronization
 /// Output format: Dual-mono stereo (Left=system audio, Right=microphone)
 /// Supports direct M4A encoding (merge + encode in one pass for 50-70% faster processing)
+///
+/// `start_offset_ms` compensates for the time difference between when each recorder's
+/// `audio_client.Start()` was called. Positive = loopback started first (common case),
+/// so we delay the loopback with `-itsoffset`. Negative = mic started first (rare).
+/// Zero = no compensation needed.
 pub async fn merge_audio_streams_smart(
     loopback_wav: &PathBuf,
     mic_wav: &PathBuf,
@@ -87,6 +92,7 @@ pub async fn merge_audio_streams_smart(
     session_id: Option<&str>,
     observer: Option<std::sync::Arc<crate::status::JsonFileObserver>>,
     total_steps: u8,
+    start_offset_ms: i64,
 ) -> Result<()> {
     use std::process::Stdio;
     use std::time::Instant;
@@ -113,6 +119,13 @@ pub async fn merge_audio_streams_smart(
     tracing::info!("    • Output Format:          {}", format_str);
     tracing::info!("    • Output Sample Rate:     {} Hz", quality.sample_rate);
     tracing::info!("    • Output Channels:        {} (Stereo)", quality.channels);
+    if start_offset_ms != 0 {
+        tracing::info!("    • Start offset:           {} ms ({})",
+            start_offset_ms.abs(),
+            if start_offset_ms > 0 { "loopback started first, delaying loopback" }
+            else { "mic started first, delaying mic" }
+        );
+    }
 
     // Check if FFmpeg is available (cached on first run)
     use std::sync::OnceLock;
@@ -392,12 +405,29 @@ pub async fn merge_audio_streams_smart(
             max_duration_secs, max_duration_secs
         );
 
+        // Convert offset to seconds for FFmpeg -itsoffset flag.
+        // Positive offset = loopback started first, so delay loopback to align with mic.
+        // Negative offset = mic started first, so delay mic to align with loopback.
+        let offset_secs = start_offset_ms.abs() as f64 / 1000.0;
+        let offset_str = format!("{:.3}", offset_secs);
+
         let mut cmd = setup_ffmpeg_command();
         cmd.arg("-hide_banner")
-            .arg("-loglevel").arg("error")
-            .arg("-i").arg(loopback_wav)
-            .arg("-i").arg(mic_wav)
-            .arg("-filter_complex")
+            .arg("-loglevel").arg("error");
+
+        if start_offset_ms > 0 {
+            // Loopback started first: delay loopback input
+            cmd.arg("-itsoffset").arg(&offset_str);
+        }
+        cmd.arg("-i").arg(loopback_wav);
+
+        if start_offset_ms < 0 {
+            // Mic started first (rare): delay mic input
+            cmd.arg("-itsoffset").arg(&offset_str);
+        }
+        cmd.arg("-i").arg(mic_wav);
+
+        cmd.arg("-filter_complex")
             .arg(&filter)
             .arg("-filter_threads").arg("auto")  // Enable parallel filter processing
             .arg("-map").arg("[aout]")
