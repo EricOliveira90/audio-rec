@@ -5,14 +5,14 @@ A Rust-based command-line tool for recording system audio and microphone on Wind
 ## Features
 
 - **Dual-channel recording** — Captures system audio (WASAPI loopback) and microphone simultaneously
-- **Real-time noise suppression** — RNNoise-based neural network noise removal on microphone audio (keyboard typing, fan noise)
-- **Noise gate** — VAD-driven 6-state noise gate with smooth attack/release ramps (no clicks)
-- **Real-time limiter** — Soft limiter prevents clipping from sudden loud sounds
-- **Loudness normalization** — EBU R128 loudness normalization to -16 LUFS (configurable)
-- **Post-processing pipeline** — Discrete stages: Merge → Normalize → Limit → Trim → Finalize
+- **Real-time noise suppression** — RNNoise-based neural network noise removal on microphone audio (planned, pipeline scaffolding exists)
+- **Noise gate** — VAD-driven 6-state noise gate with smooth attack/release ramps (planned, code exists but not yet wired to mic capture)
+- **Real-time limiter** — Soft limiter prevents clipping from sudden loud sounds (planned, code exists but not yet wired to mic capture)
+- **Loudness normalization** — EBU R128 loudness normalization to -16 LUFS (planned, not yet wired)
+- **Post-processing pipeline** — Discrete stages: Merge → Trim → Finalize (Normalize and Limit stages planned)
 - **Device selection** — Choose specific audio input/output devices by index
 - **Device enumeration** — List all available audio devices with `audio-rec devices`
-- **Process-specific capture** — Capture audio from a specific application only (e.g., `--app Zoom.exe`)
+- **Process-specific capture** — Capture audio from a specific application only (planned, not yet implemented)
 - **Enhanced status** — View active recording session info (elapsed time, devices, audio detection, etc.)
 - **Structured JSON protocol** — All stdout output is JSON, one object per line, for easy parsing
 - **Silence trimming** — Automatically trims leading/trailing silence and caps internal silence gaps at 2 seconds
@@ -20,7 +20,7 @@ A Rust-based command-line tool for recording system audio and microphone on Wind
 - **Custom output path** — Save recordings wherever you want
 - **Multiple formats** — WAV (lossless) and M4A (AAC compressed)
 - **File-based IPC** — Stop, cancel, and mute via signal files (no sockets needed)
-- **Zero-config quality** — All quality features ON by default, disable with `--no-*` flags
+- **Zero-config quality** — All quality features ON by default, disable with `--no-*` flags (some features still being wired up)
 
 ## Requirements
 
@@ -503,12 +503,13 @@ cargo test
 - [x] **Device selection** — Choose specific audio input/output devices by index
 - [x] **Device enumeration** — List available audio devices with `audio-rec devices`
 - [x] **Enhanced status** — Show active recording session info
-- [x] **Real-time noise suppression** — RNNoise-based neural network noise removal
-- [x] **Noise gate** — VAD-driven 6-state noise gate with smooth ramps
-- [x] **Audio limiter** — Real-time soft limiter + post-processing limiter
-- [x] **Loudness normalization** — EBU R128 normalization pipeline stage
-- [x] **Post-processing pipeline** — Discrete stages with JSON progress events
-- [x] **Process-specific capture** — `--app` and `--app-window` flags for app-specific audio
+- [ ] **Wire dead CLI flags** — Connect 8 parsed-but-unused flags to actual functionality ([plan](plans/wire-dead-flags-eng-review.md))
+- [ ] **Real-time noise suppression** — RNNoise-based neural network noise removal (code scaffolded, needs nnnoiseless crate + wiring to mic capture)
+- [ ] **Noise gate** — VAD-driven 6-state noise gate with smooth ramps (code implemented + tested, needs wiring to mic capture)
+- [ ] **Audio limiter** — Real-time soft limiter + post-processing limiter (RT code implemented + tested, needs wiring; post-proc needs FFmpeg integration)
+- [ ] **Loudness normalization** — EBU R128 normalization pipeline stage (measure_lufs exists, needs FFmpeg loudnorm integration)
+- [ ] **Post-processing pipeline refactor** — Switch record_worker to use PostProcessingPipeline.run() for discrete stages with JSON progress events
+- [ ] **Process-specific capture** — `--app` and `--app-window` flags for app-specific WASAPI audio capture
 - [ ] **Real-time audio level monitoring** — Emit audio level (RMS/peak) in progress events
 - [ ] **Configurable silence parameters** — Expose silence threshold and max gap duration as CLI flags
 - [ ] **Pause/resume** — Pause recording without stopping
