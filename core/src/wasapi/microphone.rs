@@ -32,6 +32,7 @@ pub struct WasapiMicrophoneRecorder {
     is_recording: Arc<AtomicBool>,
     frames_captured: Arc<AtomicU64>,
     has_audio: Arc<AtomicBool>,
+    is_ready: Arc<AtomicBool>,
     is_muted: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<Result<()>>>,
     write_errors: Arc<WriteErrorTracker>,
@@ -43,14 +44,31 @@ impl WasapiMicrophoneRecorder {
     }
 
     pub fn with_device_index(filepath: PathBuf, target_sample_rate: u32, is_muted: Arc<AtomicBool>, device_index: Option<u32>) -> Result<Self> {
+        // No start_signal = start immediately (backward compatible)
+        Self::with_device_index_and_signal(filepath, target_sample_rate, is_muted, device_index, None)
+    }
+
+    /// Create a microphone recorder with a synchronized start signal.
+    /// The recording thread will initialize WASAPI, signal readiness via `is_ready`,
+    /// then wait for `start_signal` before calling `audio_client.Start()`.
+    /// This ensures both loopback and microphone begin capturing at the same moment.
+    pub fn with_device_index_and_signal(
+        filepath: PathBuf,
+        target_sample_rate: u32,
+        is_muted: Arc<AtomicBool>,
+        device_index: Option<u32>,
+        start_signal: Option<Arc<AtomicBool>>,
+    ) -> Result<Self> {
         let is_recording = Arc::new(AtomicBool::new(true));
         let frames_captured = Arc::new(AtomicU64::new(0));
         let has_audio = Arc::new(AtomicBool::new(false));
+        let is_ready = Arc::new(AtomicBool::new(false));
         let write_errors = Arc::new(WriteErrorTracker::new());
 
         let is_recording_clone = Arc::clone(&is_recording);
         let frames_captured_clone = Arc::clone(&frames_captured);
         let has_audio_clone = Arc::clone(&has_audio);
+        let is_ready_clone = Arc::clone(&is_ready);
         let is_muted_clone = Arc::clone(&is_muted);
         let write_errors_clone = Arc::clone(&write_errors);
 
@@ -62,9 +80,11 @@ impl WasapiMicrophoneRecorder {
                 is_recording_clone,
                 frames_captured_clone,
                 has_audio_clone,
+                is_ready_clone,
                 is_muted_clone,
                 write_errors_clone,
                 device_index,
+                start_signal,
             )
         });
 
@@ -72,6 +92,7 @@ impl WasapiMicrophoneRecorder {
             is_recording,
             frames_captured,
             has_audio,
+            is_ready,
             is_muted,
             thread_handle: Some(handle),
             write_errors,
@@ -84,9 +105,11 @@ impl WasapiMicrophoneRecorder {
         is_recording: Arc<AtomicBool>,
         frames_captured: Arc<AtomicU64>,
         has_audio: Arc<AtomicBool>,
+        is_ready: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
         write_errors: Arc<WriteErrorTracker>,
         device_index: Option<u32>,
+        start_signal: Option<Arc<AtomicBool>>,
     ) -> Result<()> {
         unsafe {
             // Initialize COM for this thread
@@ -173,6 +196,25 @@ impl WasapiMicrophoneRecorder {
             let writer = WavWriter::create(&filepath, spec)?;
             let mut writer = Some(writer);
             tracing::info!("WAV writer created successfully");
+
+            // Signal that initialization is complete and we're ready to start
+            is_ready.store(true, Ordering::Release);
+            tracing::info!("Microphone recorder initialized and ready");
+
+            // If a start signal was provided, wait for it before starting capture.
+            // This ensures synchronized start with the loopback recorder.
+            if let Some(ref signal) = start_signal {
+                tracing::info!("Waiting for synchronized start signal...");
+                while !signal.load(Ordering::Acquire) {
+                    if !is_recording.load(Ordering::Relaxed) {
+                        // Recording was cancelled before start
+                        CoUninitialize();
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+                tracing::info!("Start signal received, beginning microphone capture");
+            }
 
             // Start audio client
             tracing::info!("Starting microphone audio client...");
@@ -345,6 +387,12 @@ impl WasapiMicrophoneRecorder {
 
     pub fn has_audio_detected(&self) -> bool {
         self.has_audio.load(Ordering::Relaxed)
+    }
+
+    /// Returns true once the recording thread has finished WASAPI initialization
+    /// and is ready to start capturing (or is already capturing).
+    pub fn is_ready(&self) -> bool {
+        self.is_ready.load(Ordering::Acquire)
     }
 
     pub fn is_muted(&self) -> bool {

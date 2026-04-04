@@ -237,12 +237,25 @@ async fn record_worker(
             session.id.as_str()
         ));
 
+        // Create a shared start signal for synchronized capture start.
+        // Both recorders will initialize WASAPI, signal readiness, then wait
+        // for this signal before calling audio_client.Start().
+        let start_signal = Arc::new(AtomicBool::new(false));
+
         // Initialize loopback recorder (system audio) - REQUIRED
         let loopback_recorder = if let Some(idx) = output_device_index {
             tracing::info!("Using output device index {} for loopback recording", idx);
-            WasapiLoopbackRecorder::with_device_index(loopback_temp.clone(), Some(idx))?
+            WasapiLoopbackRecorder::with_device_index_and_signal(
+                loopback_temp.clone(),
+                Some(idx),
+                Some(Arc::clone(&start_signal)),
+            )?
         } else {
-            WasapiLoopbackRecorder::new(loopback_temp.clone())?
+            WasapiLoopbackRecorder::with_device_index_and_signal(
+                loopback_temp.clone(),
+                None,
+                Some(Arc::clone(&start_signal)),
+            )?
         };
 
         // Get loopback sample rate to match microphone
@@ -255,17 +268,20 @@ async fn record_worker(
         // Initialize microphone recorder with matched sample rate and mute flag
         let mut mic_recorder = match if let Some(idx) = input_device_index {
             tracing::info!("Using input device index {} for microphone recording", idx);
-            WasapiMicrophoneRecorder::with_device_index(
+            WasapiMicrophoneRecorder::with_device_index_and_signal(
                 mic_temp.clone(),
                 target_sample_rate,
                 is_mic_muted.clone(),
                 Some(idx),
+                Some(Arc::clone(&start_signal)),
             )
         } else {
-            WasapiMicrophoneRecorder::new(
+            WasapiMicrophoneRecorder::with_device_index_and_signal(
                 mic_temp.clone(),
                 target_sample_rate,
                 is_mic_muted.clone(),
+                None,
+                Some(Arc::clone(&start_signal)),
             )
         } {
             Ok(recorder) => {
@@ -281,6 +297,37 @@ async fn record_worker(
                 None
             }
         };
+
+        // Wait for both recorders to finish WASAPI initialization before starting capture.
+        // This eliminates the timing gap where loopback would start capturing hundreds of
+        // milliseconds before the microphone, causing audio desync in the merged output.
+        {
+            let ready_timeout = std::time::Duration::from_secs(5);
+            let ready_start = std::time::Instant::now();
+            tracing::info!("Waiting for recorders to be ready...");
+
+            loop {
+                let loopback_ready = loopback_recorder.is_ready();
+                let mic_ready = mic_recorder.as_ref().map(|m| m.is_ready()).unwrap_or(true);
+
+                if loopback_ready && mic_ready {
+                    break;
+                }
+
+                if ready_start.elapsed() >= ready_timeout {
+                    tracing::warn!(
+                        "Recorder readiness timeout (loopback={}, mic={}). Starting anyway.",
+                        loopback_ready, mic_ready
+                    );
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            tracing::info!("All recorders ready — sending synchronized start signal");
+            start_signal.store(true, Ordering::Release);
+        }
 
         let start_time = std::time::Instant::now();
 
