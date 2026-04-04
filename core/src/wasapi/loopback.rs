@@ -190,6 +190,42 @@ impl WasapiLoopbackRecorder {
             // Start audio client
             audio_client.Start()?;
 
+            // Drain any stale audio data from the render endpoint's buffer.
+            // WASAPI loopback capture in shared mode may deliver audio that was
+            // already queued in the render buffer before Start() was called.
+            // Discarding these initial packets prevents the loopback stream from
+            // containing audio that predates the recording start, which would
+            // cause it to appear ahead of the microphone stream in the merged output.
+            {
+                let mut drained_packets = 0u32;
+                let mut drained_frames = 0u64;
+                loop {
+                    let packet_length = capture_client.GetNextPacketSize()?;
+                    if packet_length == 0 {
+                        break;
+                    }
+                    let mut buffer: *mut u8 = std::ptr::null_mut();
+                    let mut num_frames = 0u32;
+                    let mut flags = 0u32;
+                    capture_client.GetBuffer(
+                        &mut buffer,
+                        &mut num_frames,
+                        &mut flags,
+                        None,
+                        None,
+                    )?;
+                    drained_frames += num_frames as u64;
+                    drained_packets += 1;
+                    capture_client.ReleaseBuffer(num_frames)?;
+                }
+                if drained_packets > 0 {
+                    tracing::info!(
+                        "Drained {} stale loopback packets ({} frames) from render buffer",
+                        drained_packets, drained_frames
+                    );
+                }
+            }
+
             tracing::info!(
                 "Recording with: {:?} format",
                 sample_format
