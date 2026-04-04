@@ -120,6 +120,10 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
     // Parse boolean flags
     let mic_muted = has_flag(args, "--mic-muted");
     let trim_silence = !has_flag(args, "--no-trim"); // On by default
+    let normalize = !has_flag(args, "--no-normalize"); // On by default
+    let limiter = !has_flag(args, "--no-limiter"); // On by default
+    let denoise = !has_flag(args, "--no-denoise"); // On by default
+    let noise_gate = !has_flag(args, "--no-noise-gate"); // On by default
 
     // Parse --input-device / -id (optional device index for microphone)
     let input_device_index = if let Some(idx_str) = parse_flag_value(args, "--input-device", Some("-id")) {
@@ -153,6 +157,36 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
         None
     };
 
+    // Parse --target-loudness (default: -16.0 LUFS)
+    let target_loudness = if let Some(val_str) = parse_flag_value(args, "--target-loudness", None) {
+        match val_str.parse::<f64>() {
+            Ok(val) => val,
+            Err(_) => {
+                output.error(&format!("Invalid target loudness '{}'. Must be a number (e.g., -16).", val_str));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        -16.0
+    };
+
+    // Parse --gate-threshold (default: 0.5)
+    let gate_threshold = if let Some(val_str) = parse_flag_value(args, "--gate-threshold", None) {
+        match val_str.parse::<f64>() {
+            Ok(val) => val,
+            Err(_) => {
+                output.error(&format!("Invalid gate threshold '{}'. Must be a number.", val_str));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        0.5
+    };
+
+    // Parse --app and --app-window (process-specific capture)
+    let app = parse_flag_value(args, "--app", None);
+    let app_window = parse_flag_value(args, "--app-window", None);
+
     let options = RecordOptions {
         duration,
         audio_format,
@@ -162,6 +196,14 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
         trim_silence,
         input_device_index,
         output_device_index,
+        normalize,
+        limiter,
+        denoise,
+        noise_gate,
+        target_loudness,
+        gate_threshold,
+        app,
+        app_window,
     };
 
     commands::record::execute_with_output(options, config, output.clone()).await
@@ -346,9 +388,9 @@ mod tests {
 
     // ── RecordOptions construction tests ──
 
-    #[test]
-    fn test_record_options_default_device_indices_are_none() {
-        let options = RecordOptions {
+    /// Helper to create default RecordOptions for tests
+    fn default_options() -> RecordOptions {
+        RecordOptions {
             duration: RecordingDuration::Indefinite,
             audio_format: AudioFormat::Wav,
             quality: RecordingQuality::professional(),
@@ -357,27 +399,59 @@ mod tests {
             trim_silence: true,
             input_device_index: None,
             output_device_index: None,
-        };
+            normalize: true,
+            limiter: true,
+            denoise: true,
+            noise_gate: true,
+            target_loudness: -16.0,
+            gate_threshold: 0.5,
+            app: None,
+            app_window: None,
+        }
+    }
 
+    #[test]
+    fn test_record_options_default_device_indices_are_none() {
+        let options = default_options();
         assert!(options.input_device_index.is_none());
         assert!(options.output_device_index.is_none());
     }
 
     #[test]
     fn test_record_options_with_device_indices() {
-        let options = RecordOptions {
-            duration: RecordingDuration::Indefinite,
-            audio_format: AudioFormat::Wav,
-            quality: RecordingQuality::professional(),
-            output_path: None,
-            mic_muted: false,
-            trim_silence: true,
-            input_device_index: Some(0),
-            output_device_index: Some(1),
-        };
-
+        let mut options = default_options();
+        options.input_device_index = Some(0);
+        options.output_device_index = Some(1);
         assert_eq!(options.input_device_index, Some(0));
         assert_eq!(options.output_device_index, Some(1));
+    }
+
+    #[test]
+    fn test_record_options_quality_features_on_by_default() {
+        let options = default_options();
+        assert!(options.normalize);
+        assert!(options.limiter);
+        assert!(options.denoise);
+        assert!(options.noise_gate);
+    }
+
+    #[test]
+    fn test_record_options_default_target_loudness() {
+        let options = default_options();
+        assert_eq!(options.target_loudness, -16.0);
+    }
+
+    #[test]
+    fn test_record_options_default_gate_threshold() {
+        let options = default_options();
+        assert_eq!(options.gate_threshold, 0.5);
+    }
+
+    #[test]
+    fn test_record_options_app_defaults_to_none() {
+        let options = default_options();
+        assert!(options.app.is_none());
+        assert!(options.app_window.is_none());
     }
 
     // ── has_flag tests ──
@@ -396,5 +470,103 @@ mod tests {
     fn test_has_flag_absent() {
         let args: Vec<String> = vec!["audio-rec".into(), "record".into()];
         assert!(!has_flag(&args, "--mic-muted"));
+    }
+
+    // ── Quality feature flag tests ──
+
+    #[test]
+    fn test_no_normalize_flag_detected() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--no-normalize".into(),
+        ];
+        assert!(has_flag(&args, "--no-normalize"));
+    }
+
+    #[test]
+    fn test_no_limiter_flag_detected() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--no-limiter".into(),
+        ];
+        assert!(has_flag(&args, "--no-limiter"));
+    }
+
+    #[test]
+    fn test_no_denoise_flag_detected() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--no-denoise".into(),
+        ];
+        assert!(has_flag(&args, "--no-denoise"));
+    }
+
+    #[test]
+    fn test_no_noise_gate_flag_detected() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--no-noise-gate".into(),
+        ];
+        assert!(has_flag(&args, "--no-noise-gate"));
+    }
+
+    #[test]
+    fn test_target_loudness_flag_parsed() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--target-loudness".into(),
+            "-23".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--target-loudness", None),
+            Some("-23".to_string())
+        );
+    }
+
+    #[test]
+    fn test_gate_threshold_flag_parsed() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--gate-threshold".into(),
+            "0.7".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--gate-threshold", None),
+            Some("0.7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_app_flag_parsed() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--app".into(),
+            "Zoom.exe".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--app", None),
+            Some("Zoom.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn test_app_window_flag_parsed() {
+        let args: Vec<String> = vec![
+            "audio-rec".into(),
+            "record".into(),
+            "--app-window".into(),
+            "Zoom Meeting".into(),
+        ];
+        assert_eq!(
+            parse_flag_value(&args, "--app-window", None),
+            Some("Zoom Meeting".to_string())
+        );
     }
 }

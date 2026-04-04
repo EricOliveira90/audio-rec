@@ -28,6 +28,17 @@ pub struct RecordOptions {
     pub trim_silence: bool,
     pub input_device_index: Option<u32>,
     pub output_device_index: Option<u32>,
+    // Quality feature flags (all ON by default)
+    pub normalize: bool,
+    pub limiter: bool,
+    pub denoise: bool,
+    pub noise_gate: bool,
+    // Quality feature configuration
+    pub target_loudness: f64,    // LUFS, default -16.0
+    pub gate_threshold: f64,     // VAD probability 0.0-1.0 or dB, default 0.5
+    // Process-specific capture
+    pub app: Option<String>,         // --app <name>
+    pub app_window: Option<String>,  // --app-window <title>
 }
 
 /// Emit a structured JSON event to stdout for the calling tool
