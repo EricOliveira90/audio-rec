@@ -200,6 +200,16 @@ impl WasapiMicrophoneRecorder {
             );
             tracing::info!("Microphone audio client started, entering recording loop...");
 
+            // Track total frames written to the WAV file and the recording start time.
+            // When WASAPI microphone delivers no packets (rare but possible), we
+            // calculate how many silence frames are needed to keep the WAV duration
+            // aligned with wall-clock time. This matches the loopback recorder's
+            // approach and prevents progressive drift between the two tracks over
+            // long recordings caused by hardware clock differences.
+            let mut total_frames_written: u64 = 0;
+            let recording_start = Instant::now();
+            let channels_usize = channels as usize;
+
             // Recording loop
             let mut loop_count = 0u64;
             let mut total_packets_received = 0u64;
@@ -237,6 +247,7 @@ impl WasapiMicrophoneRecorder {
 
                     if num_frames > 0 {
                         frames_captured.fetch_add(1, Ordering::Relaxed);
+                        total_frames_written += num_frames as u64;
                         let total_samples = (num_frames * channels as u32) as usize;
 
                         // Check if buffer contains silence (AUDCLNT_BUFFERFLAGS_SILENT = 0x2)
@@ -323,6 +334,29 @@ impl WasapiMicrophoneRecorder {
                     }
 
                     capture_client.ReleaseBuffer(num_frames)?;
+                } else {
+                    // No packets available from microphone.
+                    // Calculate how many frames SHOULD have been written by now based on
+                    // wall-clock time, then write silence to fill the gap. This keeps the
+                    // mic WAV duration aligned with wall-clock time, matching the loopback
+                    // recorder's approach and preventing progressive drift between the two
+                    // tracks over long recordings.
+                    let elapsed_secs = recording_start.elapsed().as_secs_f64();
+                    let expected_frames = (elapsed_secs * sample_rate as f64) as u64;
+
+                    if expected_frames > total_frames_written {
+                        let gap_frames = (expected_frames - total_frames_written) as usize;
+                        let gap_samples = gap_frames * channels_usize;
+
+                        if let Some(writer) = writer.as_mut() {
+                            for _ in 0..gap_samples {
+                                if let Err(e) = writer.write_sample(0i16) {
+                                    write_errors.record_error(&e);
+                                }
+                            }
+                        }
+                        total_frames_written += gap_frames as u64;
+                    }
                 }
             }
 

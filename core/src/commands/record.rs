@@ -130,7 +130,7 @@ pub async fn execute_with_output(
     // Ensure internal directories exist (for status/signals/temp files)
     config.ensure_directories()?;
 
-    // Emit started event (includes device names when specified)
+    // Emit started event (includes device names and capture mode when specified)
     let mut started_event = json!({
         "type": "started",
         "session_id": session.id.as_str(),
@@ -149,6 +149,16 @@ pub async fn execute_with_output(
         started_event["output_device"] = json!(name);
         started_event["output_device_index"] = json!(options.output_device_index);
     }
+    // Include process-specific capture info in started event
+    if let Some(ref app_name) = options.app {
+        started_event["capture_mode"] = json!("process");
+        started_event["app"] = json!(app_name);
+    } else if let Some(ref window_title) = options.app_window {
+        started_event["capture_mode"] = json!("process");
+        started_event["app_window"] = json!(window_title);
+    } else {
+        started_event["capture_mode"] = json!("system");
+    }
     emit_event(&started_event);
 
     // Now do the actual recording (this blocks, keeping process alive)
@@ -161,6 +171,8 @@ pub async fn execute_with_output(
         options.trim_silence,
         options.input_device_index,
         options.output_device_index,
+        options.app,
+        options.app_window,
     ).await?;
 
     Ok(())
@@ -207,6 +219,8 @@ async fn record_worker(
     trim_silence: bool,
     input_device_index: Option<u32>,
     output_device_index: Option<u32>,
+    app: Option<String>,
+    app_window: Option<String>,
 ) -> Result<()> {
     // Capture values for the span before moving session
     let session_id = session.id.clone();
@@ -237,13 +251,125 @@ async fn record_worker(
             session.id.as_str()
         ));
 
-        // Initialize loopback recorder (system audio) - REQUIRED
-        let loopback_recorder = if let Some(idx) = output_device_index {
-            tracing::info!("Using output device index {} for loopback recording", idx);
-            WasapiLoopbackRecorder::with_device_index(loopback_temp.clone(), Some(idx))?
-        } else {
-            WasapiLoopbackRecorder::new(loopback_temp.clone())?
-        };
+        // Determine capture mode: process-specific or system-wide
+        let mut capture_mode: String;
+        let _capture_app = app.clone();
+        let _capture_app_window = app_window.clone();
+
+        // Initialize loopback recorder — either process-specific or system-wide
+        let mut loopback_recorder: Box<dyn crate::wasapi::capture_engine::LoopbackCapture> =
+            if let Some(ref app_name) = app {
+                // Process-specific capture via --app
+                capture_mode = "process".to_string();
+
+                // Check Windows version
+                if !crate::wasapi::process_resolver::check_windows_version() {
+                    emit_event(&json!({
+                        "type": "warning",
+                        "session_id": session.id.as_str(),
+                        "code": "unsupported_version",
+                        "message": "Windows version does not support process-specific loopback (requires Build 20348+). Falling back to system audio capture."
+                    }));
+                    tracing::warn!("Windows version too old for process loopback, falling back to system audio");
+                    capture_mode = "system".to_string();
+                    Box::new(WasapiLoopbackRecorder::new(loopback_temp.clone())?)
+                } else {
+                    // Resolve PID
+                    let pid = crate::wasapi::process_resolver::resolve_by_process_name(app_name)?;
+                    tracing::info!("Resolved process '{}' to PID {}", app_name, pid);
+
+                    // Warn if --output-device is also specified (ignored for process loopback)
+                    if output_device_index.is_some() {
+                        emit_event(&json!({
+                            "type": "warning",
+                            "session_id": session.id.as_str(),
+                            "code": "output_device_ignored",
+                            "message": "Output device selection is ignored when using --app (process-specific capture)."
+                        }));
+                    }
+
+                    match crate::wasapi::process_loopback::ProcessLoopbackRecorder::new(
+                        loopback_temp.clone(),
+                        pid,
+                    ) {
+                        Ok(recorder) => {
+                            tracing::info!("Process loopback recorder created for PID {}", pid);
+                            Box::new(recorder)
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create process loopback recorder: {}. Falling back to system audio.", e);
+                            emit_event(&json!({
+                                "type": "warning",
+                                "session_id": session.id.as_str(),
+                                "code": "process_loopback_failed",
+                                "message": format!("Process loopback failed: {}. Falling back to system audio.", e)
+                            }));
+                            capture_mode = "system".to_string();
+                            Box::new(WasapiLoopbackRecorder::new(loopback_temp.clone())?)
+                        }
+                    }
+                }
+            } else if let Some(ref window_title) = app_window {
+                // Process-specific capture via --app-window
+                capture_mode = "process".to_string();
+
+                if !crate::wasapi::process_resolver::check_windows_version() {
+                    emit_event(&json!({
+                        "type": "warning",
+                        "session_id": session.id.as_str(),
+                        "code": "unsupported_version",
+                        "message": "Windows version does not support process-specific loopback (requires Build 20348+). Falling back to system audio capture."
+                    }));
+                    tracing::warn!("Windows version too old for process loopback, falling back to system audio");
+                    capture_mode = "system".to_string();
+                    Box::new(WasapiLoopbackRecorder::new(loopback_temp.clone())?)
+                } else {
+                    let pid = crate::wasapi::process_resolver::resolve_by_window_title(window_title)?;
+                    tracing::info!("Resolved window title '{}' to PID {}", window_title, pid);
+
+                    if output_device_index.is_some() {
+                        emit_event(&json!({
+                            "type": "warning",
+                            "session_id": session.id.as_str(),
+                            "code": "output_device_ignored",
+                            "message": "Output device selection is ignored when using --app-window (process-specific capture)."
+                        }));
+                    }
+
+                    match crate::wasapi::process_loopback::ProcessLoopbackRecorder::new(
+                        loopback_temp.clone(),
+                        pid,
+                    ) {
+                        Ok(recorder) => {
+                            tracing::info!("Process loopback recorder created for PID {}", pid);
+                            Box::new(recorder)
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create process loopback recorder: {}. Falling back to system audio.", e);
+                            emit_event(&json!({
+                                "type": "warning",
+                                "session_id": session.id.as_str(),
+                                "code": "process_loopback_failed",
+                                "message": format!("Process loopback failed: {}. Falling back to system audio.", e)
+                            }));
+                            capture_mode = "system".to_string();
+                            Box::new(WasapiLoopbackRecorder::new(loopback_temp.clone())?)
+                        }
+                    }
+                }
+            } else {
+                // Standard system-wide loopback
+                capture_mode = "system".to_string();
+                if let Some(idx) = output_device_index {
+                    tracing::info!("Using output device index {} for loopback recording", idx);
+                    Box::new(WasapiLoopbackRecorder::with_device_index(loopback_temp.clone(), Some(idx))?)
+                } else {
+                    Box::new(WasapiLoopbackRecorder::new(loopback_temp.clone())?)
+                }
+            };
+
+        // capture_mode may change during recording (e.g., process exits → system fallback)
+        let mut capture_mode = capture_mode;
 
         // Get loopback sample rate to match microphone
         let target_sample_rate = loopback_recorder.get_sample_rate();
@@ -311,6 +437,10 @@ async fn record_worker(
             // FFmpeg progress (not applicable during recording)
             ffmpeg_progress: None,
             processing_speed: None,
+            // Process-specific capture fields
+            capture_mode: Some(capture_mode.clone()),
+            app: _capture_app.clone(),
+            app_window: _capture_app_window.clone(),
         })?;
 
         // Track previous state for change detection (only emit events on state changes)
@@ -409,6 +539,45 @@ async fn record_worker(
                 }
             }
 
+            // ── Mid-recording fallback: process exit detection ──
+            // If the target process has exited, fall back to system-wide loopback
+            if capture_mode == "process" && loopback_recorder.is_process_dead() {
+                tracing::warn!("Target process exited during recording, falling back to system-wide loopback");
+
+                // Emit warning event
+                emit_event(&json!({
+                    "type": "warning",
+                    "session_id": session.id.as_str(),
+                    "code": "process_exited",
+                    "message": "Target process has exited. Falling back to system-wide audio capture."
+                }));
+
+                // Stop the process-specific recorder
+                loopback_recorder.stop()?;
+
+                // Attempt to create a system-wide loopback recorder writing to the same temp file
+                match WasapiLoopbackRecorder::new(loopback_temp.clone()) {
+                    Ok(new_recorder) => {
+                        loopback_recorder = Box::new(new_recorder);
+                        capture_mode = "system".to_string();
+                        tracing::info!("Successfully fell back to system-wide loopback recording");
+                    }
+                    Err(e) => {
+                        // Fallback recorder creation failed (rare: audio device disconnected)
+                        // Continue with mic-only recording
+                        tracing::error!("Failed to create fallback system loopback recorder: {}. Continuing with mic-only.", e);
+                        emit_event(&json!({
+                            "type": "error",
+                            "session_id": session.id.as_str(),
+                            "code": "fallback_failed",
+                            "message": format!("Failed to create fallback recorder: {}. Continuing with microphone only.", e)
+                        }));
+                        capture_mode = "system".to_string();
+                        // Don't break — mic recording continues
+                    }
+                }
+            }
+
             // Detect state changes and emit events only when something changes
             let cur_loopback_has_audio = loopback_recorder.has_audio_detected();
             let cur_mic_has_audio = mic_recorder.as_ref().map(|m| m.has_audio_detected());
@@ -425,6 +594,7 @@ async fn record_worker(
                     "loopback_has_audio": cur_loopback_has_audio,
                     "mic_has_audio": cur_mic_has_audio,
                     "is_mic_muted": cur_mic_muted,
+                    "capture_mode": &capture_mode,
                 }));
 
                 // Calculate progress for status file
@@ -459,6 +629,9 @@ async fn record_worker(
                     is_mic_muted: Some(cur_mic_muted),
                     ffmpeg_progress: None,
                     processing_speed: None,
+                    capture_mode: Some(capture_mode.clone()),
+                    app: _capture_app.clone(),
+                    app_window: _capture_app_window.clone(),
                 })?;
 
                 // Update tracked state
@@ -652,6 +825,25 @@ async fn record_worker(
 
         // Copy then remove (works across drives, unlike rename)
         std::fs::copy(&merge_output_path, &final_output_path)?;
+
+        // Keep the pre-trim merged file for debugging desync issues.
+        // Stored alongside the final output with a _merged suffix so the user
+        // can compare the merged (pre-trim) vs final (post-trim) audio.
+        let debug_merged_path = {
+            let stem = final_output_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("recording");
+            let ext = final_output_path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("wav");
+            final_output_path.with_file_name(format!("{}_merged.{}", stem, ext))
+        };
+        if let Err(e) = std::fs::copy(&merge_output_path, &debug_merged_path) {
+            tracing::warn!("Could not save debug merged file: {}", e);
+        } else {
+            tracing::info!("Debug pre-trim merged file saved to: {:?}", debug_merged_path);
+        }
+
         let _ = std::fs::remove_file(&merge_output_path);
 
         tracing::info!("Final file saved to: {:?}", final_output_path);
