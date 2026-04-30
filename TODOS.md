@@ -62,6 +62,18 @@
 
 ## From: Engineering Review (Risk Mitigation)
 
+### Fallback Recorder Creation Failure Handling
+- **What:** Handle the case where the mid-recording fallback to system loopback fails (e.g., audio device disconnected simultaneously) during process-specific capture.
+- **Why:** If the target process exits AND the system loopback recorder can't be created, the recording is lost. Currently unhandled.
+- **Pros:** Prevents total recording loss in a rare but realistic scenario.
+- **Cons:** Adds complexity to the fallback path. The scenario is rare (process exit + device disconnect simultaneously).
+- **Context:** During mid-recording fallback in the process-specific capture feature (Issue #25), if `WasapiLoopbackRecorder::new()` fails, the recorder should continue with mic-only recording and emit an error event. This is a defensive measure, not a common path.
+- **Depends on:** Process-specific capture implementation (Issue #25 PRD).
+
+---
+
+## From: Engineering Review (Process-Specific Capture, Issue #25)
+
 ### --legacy-capture flag during Phase 1 development
 - **What:** Preserve the current polling-based capture loop behind a `--legacy-capture` flag during Phase 1 development. Remove the flag after event-driven capture is stable.
 - **Why:** Phase 1 changes the fundamental capture loop. If event-driven capture introduces regressions on specific hardware, users need a fallback.

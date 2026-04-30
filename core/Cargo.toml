@@ -17,11 +17,17 @@ tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.58"
 windows = { version = "0.58", features = [
+    "implement",
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_Foundation",
     "Win32_Devices_Properties",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com_StructuredStorage",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
 ] }

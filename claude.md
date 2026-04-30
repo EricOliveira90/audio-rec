@@ -1,6 +1,6 @@
 # Claude Development Guidelines for Audio Recorder Manager
 
-You are on Windows 11.
+You are on Windows 11 on Powershell.
 
 ## Critical: Antivirus Considerations
 

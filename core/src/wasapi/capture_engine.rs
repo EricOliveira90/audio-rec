@@ -10,6 +10,48 @@
 //! All unsafe operations follow the same safety invariants documented in `loopback.rs`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+// ── LoopbackCapture trait ──
+
+/// Trait abstracting the public interface shared by both loopback recorders
+/// (system-wide and process-specific).
+///
+/// This enables `record.rs` to use `Box<dyn LoopbackCapture>` instead of
+/// a concrete recorder type, allowing seamless switching between system
+/// and process-specific loopback capture.
+///
+/// These methods are called once per second in the status check loop,
+/// not in the audio hot path — zero performance concern from vtable dispatch.
+pub trait LoopbackCapture: Send {
+    /// Stop the recorder and finalize the WAV file.
+    fn stop(&mut self) -> anyhow::Result<()>;
+
+    /// Get the number of audio frame batches captured so far.
+    fn get_frames_captured(&self) -> u64;
+
+    /// Whether any non-silent audio has been detected.
+    fn has_audio_detected(&self) -> bool;
+
+    /// The sample rate of the audio being captured.
+    fn get_sample_rate(&self) -> u32;
+
+    /// The wall-clock time when audio capture actually started.
+    /// Returns None if the recording thread hasn't started yet.
+    fn get_start_time(&self) -> Option<Instant>;
+
+    /// Whether the target process has exited during recording.
+    ///
+    /// Only meaningful for `ProcessLoopbackRecorder`. System loopback
+    /// always returns `false` (no target process to monitor).
+    ///
+    /// Used by the record command's status loop to detect when a
+    /// process-specific recorder needs to be swapped for a system
+    /// loopback recorder (mid-recording fallback).
+    fn is_process_dead(&self) -> bool {
+        false // Default: system loopback has no target process
+    }
+}
 
 // ── Sample format detection ──
 

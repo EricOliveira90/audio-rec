@@ -46,6 +46,13 @@ pub struct StatusOutput {
     pub ffmpeg_progress: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processing_speed: Option<String>,
+    // Process-specific capture fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_window: Option<String>,
 }
 
 impl StatusOutput {
@@ -71,6 +78,9 @@ impl StatusOutput {
             processing_stage: None,
             ffmpeg_progress: None,
             processing_speed: None,
+            capture_mode: None,
+            app: None,
+            app_window: None,
         }
     }
 }
@@ -169,6 +179,20 @@ pub fn parse_status_file(content: &str) -> Option<StatusOutput> {
         None
     };
 
+    // Process-specific capture fields
+    let capture_mode = value
+        .get("capture_mode")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let app = value
+        .get("app")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let app_window = value
+        .get("app_window")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Some(StatusOutput {
         event_type: "status".to_string(),
         active: true,
@@ -189,6 +213,9 @@ pub fn parse_status_file(content: &str) -> Option<StatusOutput> {
         processing_stage,
         ffmpeg_progress,
         processing_speed,
+        capture_mode,
+        app,
+        app_window,
     })
 }
 
@@ -577,6 +604,120 @@ mod tests {
         assert!(result.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // ── Process-specific capture fields ──
+
+    #[test]
+    fn test_parse_status_with_capture_mode_and_app() {
+        let content = r#"{
+            "session_id": "rec-process-test",
+            "filename": "recording.wav",
+            "duration": 0,
+            "elapsed": 10,
+            "progress": 0,
+            "quality": "Professional (48kHz Stereo)",
+            "device": "Dual-Channel (System + Microphone)",
+            "sample_rate": 48000,
+            "channels": 2,
+            "frames_captured": 100,
+            "has_audio": true,
+            "status": "recording",
+            "capture_mode": "process",
+            "app": "Zoom.exe"
+        }"#;
+
+        let status = parse_status_file(content).unwrap();
+        assert_eq!(status.capture_mode.unwrap(), "process");
+        assert_eq!(status.app.unwrap(), "Zoom.exe");
+        assert!(status.app_window.is_none());
+    }
+
+    #[test]
+    fn test_parse_status_with_app_window() {
+        let content = r#"{
+            "session_id": "rec-window-test",
+            "filename": "recording.wav",
+            "duration": 0,
+            "elapsed": 5,
+            "progress": 0,
+            "quality": "Professional",
+            "device": "System",
+            "sample_rate": 48000,
+            "channels": 2,
+            "frames_captured": 50,
+            "has_audio": true,
+            "status": "recording",
+            "capture_mode": "process",
+            "app_window": "Zoom Meeting"
+        }"#;
+
+        let status = parse_status_file(content).unwrap();
+        assert_eq!(status.capture_mode.unwrap(), "process");
+        assert!(status.app.is_none());
+        assert_eq!(status.app_window.unwrap(), "Zoom Meeting");
+    }
+
+    #[test]
+    fn test_parse_status_system_mode_no_app_fields() {
+        let content = r#"{
+            "session_id": "rec-system-test",
+            "filename": "recording.wav",
+            "duration": 0,
+            "elapsed": 5,
+            "progress": 0,
+            "quality": "Professional",
+            "device": "System",
+            "sample_rate": 48000,
+            "channels": 2,
+            "frames_captured": 50,
+            "has_audio": true,
+            "status": "recording",
+            "capture_mode": "system"
+        }"#;
+
+        let status = parse_status_file(content).unwrap();
+        assert_eq!(status.capture_mode.unwrap(), "system");
+        assert!(status.app.is_none());
+        assert!(status.app_window.is_none());
+    }
+
+    #[test]
+    fn test_status_output_serializes_capture_mode() {
+        let content = r#"{
+            "session_id": "rec-serialize-test",
+            "filename": "recording.wav",
+            "duration": 0,
+            "elapsed": 5,
+            "progress": 0,
+            "quality": "Professional",
+            "device": "System",
+            "sample_rate": 48000,
+            "channels": 2,
+            "frames_captured": 50,
+            "has_audio": true,
+            "status": "recording",
+            "capture_mode": "process",
+            "app": "Teams.exe"
+        }"#;
+
+        let status = parse_status_file(content).unwrap();
+        let json = serde_json::to_value(&status).unwrap();
+
+        assert_eq!(json["capture_mode"], "process");
+        assert_eq!(json["app"], "Teams.exe");
+        // app_window should not be present (skip_serializing_if = None)
+        assert!(json.get("app_window").is_none());
+    }
+
+    #[test]
+    fn test_no_active_session_has_no_capture_fields() {
+        let status = StatusOutput::no_active_session();
+        let json = serde_json::to_value(&status).unwrap();
+
+        assert!(json.get("capture_mode").is_none());
+        assert!(json.get("app").is_none());
+        assert!(json.get("app_window").is_none());
     }
 
     #[test]

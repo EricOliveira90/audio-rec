@@ -186,6 +186,29 @@ pub async fn merge_audio_streams_smart(
         }
     }
 
+    // Validate input files before merge — empty/corrupt WAV files cause FFmpeg to fail
+    // with unhelpful errors. Log file sizes for diagnostics.
+    let loopback_file_size = std::fs::metadata(loopback_wav).map(|m| m.len()).unwrap_or(0);
+    let mic_file_size = std::fs::metadata(mic_wav).map(|m| m.len()).unwrap_or(0);
+
+    tracing::info!("📁 Input file sizes:");
+    tracing::info!("    • Loopback WAV: {} bytes ({:.2} KB)", loopback_file_size, loopback_file_size as f64 / 1024.0);
+    tracing::info!("    • Microphone WAV: {} bytes ({:.2} KB)", mic_file_size, mic_file_size as f64 / 1024.0);
+
+    // A valid WAV file with any audio data should be at least ~100 bytes (44-byte header + data).
+    // Files under 100 bytes are effectively empty (header only or corrupt).
+    const MIN_VALID_WAV_SIZE: u64 = 100;
+
+    let loopback_file_valid = loopback_file_size >= MIN_VALID_WAV_SIZE;
+    let mic_file_valid = mic_file_size >= MIN_VALID_WAV_SIZE;
+
+    if !loopback_file_valid {
+        tracing::warn!("⚠ Loopback WAV file is too small ({} bytes) — likely empty or corrupt", loopback_file_size);
+    }
+    if !mic_file_valid {
+        tracing::warn!("⚠ Microphone WAV file is too small ({} bytes) — likely empty or corrupt", mic_file_size);
+    }
+
     // Determine merge strategy based on audio detection flags
     tracing::info!("───────────────────────────────────────────────────────────");
     tracing::info!("⏳ Starting merge operation...");
@@ -400,9 +423,57 @@ pub async fn merge_audio_streams_smart(
         // preventing amerge from truncating to the shortest input.
         tracing::info!("📋 Merge Strategy: Dual-mono stereo (L=loopback, R=microphone)");
 
+        // Pre-merge LUFS measurement and mic gain compensation
+        // Measure loudness of both streams in parallel to determine if mic needs boosting
+        let (loopback_lufs_result, mic_lufs_result) = tokio::join!(
+            crate::ffmpeg_encoder::measure_lufs(loopback_wav),
+            crate::ffmpeg_encoder::measure_lufs(mic_wav)
+        );
+
+        let mic_gain_db = match (&loopback_lufs_result, &mic_lufs_result) {
+            (Ok(loopback_lufs), Ok(mic_lufs)) => {
+                tracing::info!("🔊 LUFS Measurement:");
+                tracing::info!("    • Loopback (system): {:.1} LUFS", loopback_lufs);
+                tracing::info!("    • Microphone (user): {:.1} LUFS", mic_lufs);
+
+                let gain = crate::ffmpeg_encoder::calculate_mic_gain_db(*loopback_lufs, *mic_lufs);
+
+                if gain != 0.0 {
+                    tracing::info!("    • Mic gain compensation: {:.1} dB", gain);
+                } else {
+                    tracing::info!("    • Mic gain compensation: skipped (streams already balanced)");
+                }
+
+                gain
+            }
+            _ => {
+                // Graceful fallback: if LUFS measurement fails, proceed without gain compensation
+                if let Err(e) = &loopback_lufs_result {
+                    tracing::warn!("⚠ Failed to measure loopback LUFS: {}. Proceeding without gain compensation.", e);
+                }
+                if let Err(e) = &mic_lufs_result {
+                    tracing::warn!("⚠ Failed to measure mic LUFS: {}. Proceeding without gain compensation.", e);
+                }
+                0.0
+            }
+        };
+
+        // Build mic input filter chain — optionally prepend volume adjustment
+        let mic_filter = if mic_gain_db != 0.0 {
+            format!(
+                "[1:a]volume={:.1}dB,aformat=channel_layouts=mono,apad=whole_dur={},asplit=2[ml][mr]",
+                mic_gain_db, max_duration_secs
+            )
+        } else {
+            format!(
+                "[1:a]aformat=channel_layouts=mono,apad=whole_dur={},asplit=2[ml][mr]",
+                max_duration_secs
+            )
+        };
+
         let filter = format!(
-            "[0:a]aformat=channel_layouts=stereo,apad=whole_dur={}[left];[1:a]aformat=channel_layouts=mono,apad=whole_dur={},asplit=2[ml][mr];[left][ml][mr]amerge=inputs=3,pan=stereo|c0<c0+c2|c1<c1+c2[aout]",
-            max_duration_secs, max_duration_secs
+            "[0:a]aformat=channel_layouts=stereo,apad=whole_dur={}[left];{};[left][ml][mr]amerge=inputs=3,pan=stereo|c0<c0+c2|c1<c1+c2[aout]",
+            max_duration_secs, mic_filter
         );
 
         // Convert offset to seconds for FFmpeg -itsoffset flag.
@@ -499,19 +570,59 @@ pub async fn merge_audio_streams_smart(
 
         result
     } else {
-        // Scenario D: Neither has audio - Use loopback file (valid silent stereo)
+        // Scenario D: Neither has audio — create a silent output file.
+        //
+        // If the loopback WAV is valid, use it as input (preserves original duration).
+        // If it's empty/corrupt (common with process loopback when the target process
+        // doesn't produce audio), generate silence using FFmpeg's anullsrc filter
+        // to avoid "Invalid data found when processing input" errors.
         tracing::info!("📋 Merge Strategy: Both channels silent (creating silent stereo file)");
 
         let mut cmd = setup_ffmpeg_command();
         cmd.arg("-hide_banner")
-            .arg("-loglevel").arg("error")
-            .arg("-i")
-            .arg(loopback_wav)
-            .arg("-filter_complex")
-            .arg("[0:a]aformat=channel_layouts=stereo[aout]")
-            .arg("-map")
-            .arg("[aout]")
-            .arg("-ar")
+            .arg("-loglevel").arg("error");
+
+        if loopback_file_valid {
+            // Loopback WAV is valid — use it as input
+            tracing::info!("    Using loopback WAV as silent stereo source");
+            cmd.arg("-i")
+                .arg(loopback_wav)
+                .arg("-filter_complex")
+                .arg("[0:a]aformat=channel_layouts=stereo[aout]")
+                .arg("-map")
+                .arg("[aout]");
+        } else if mic_file_valid {
+            // Loopback WAV is invalid but mic WAV is valid — use mic as source
+            tracing::info!("    Loopback WAV invalid, using microphone WAV as silent stereo source");
+            cmd.arg("-i")
+                .arg(mic_wav)
+                .arg("-filter_complex")
+                .arg("[0:a]aformat=channel_layouts=stereo[aout]")
+                .arg("-map")
+                .arg("[aout]");
+        } else {
+            // Both files are invalid — generate silence with anullsrc.
+            // Use the effective duration (from recording time) or fall back to 1 second.
+            let silence_duration_secs = if effective_duration_ms > 0 {
+                effective_duration_ms as f64 / 1000.0
+            } else {
+                1.0
+            };
+            tracing::warn!(
+                "    Both WAV files are invalid/empty. Generating {:.1}s of silence with anullsrc.",
+                silence_duration_secs
+            );
+            cmd.arg("-f").arg("lavfi")
+                .arg("-i")
+                .arg(format!(
+                    "anullsrc=channel_layout=stereo:sample_rate={}",
+                    &target_sample_rate
+                ))
+                .arg("-t")
+                .arg(format!("{:.3}", silence_duration_secs));
+        }
+
+        cmd.arg("-ar")
             .arg(&target_sample_rate);
 
         add_encoding_params(&mut cmd, output_format);
@@ -528,7 +639,22 @@ pub async fn merge_audio_streams_smart(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("FFmpeg merge failed: {}", stderr);
+        // When progress monitoring is enabled, stderr is consumed by the progress parser,
+        // so the error message may be empty. Include file diagnostics to help debug.
+        let stderr_msg = if stderr.trim().is_empty() {
+            format!(
+                "(stderr consumed by progress parser — check logs above for details). \
+                 Input file sizes: loopback={} bytes, mic={} bytes. \
+                 Audio detected: loopback={}, mic={}. \
+                 Exit code: {:?}",
+                loopback_file_size, mic_file_size,
+                loopback_has_audio, mic_has_audio,
+                output.status.code()
+            )
+        } else {
+            stderr.to_string()
+        };
+        anyhow::bail!("FFmpeg merge failed: {}", stderr_msg);
     }
 
     // Mark FFmpeg merge/encoding as complete to ensure UI transitions properly

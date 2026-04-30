@@ -644,6 +644,97 @@ pub async fn trim_silence(
     Ok(input_path.clone())
 }
 
+/// Measure the integrated loudness (LUFS) of an audio file using FFmpeg's loudnorm filter.
+/// Returns the integrated loudness in LUFS, or an error if measurement fails.
+///
+/// Uses FFmpeg in measurement-only mode:
+/// `ffmpeg -i <file> -af loudnorm=print_format=json -f null -`
+///
+/// Parses the JSON output from stderr for the `input_i` (integrated loudness) value.
+pub async fn measure_lufs(audio_path: &PathBuf) -> Result<f64> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+        .arg("-i").arg(audio_path)
+        .arg("-af").arg("loudnorm=print_format=json")
+        .arg("-f").arg("null")
+        .arg("-");
+
+    // CREATE_NO_WINDOW: Approved for FFmpeg to prevent console window flashing on Windows
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("FFmpeg LUFS measurement failed: {}", stderr);
+    }
+
+    // The loudnorm JSON is embedded in stderr output
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Find the JSON block in the output — it starts with '{' and ends with '}'
+    // FFmpeg outputs it after the loudnorm filter summary
+    let json_start = stderr.rfind('{')
+        .ok_or_else(|| anyhow::anyhow!("No JSON block found in FFmpeg loudnorm output"))?;
+    let json_end = stderr.rfind('}')
+        .ok_or_else(|| anyhow::anyhow!("No closing brace found in FFmpeg loudnorm output"))?;
+
+    if json_end <= json_start {
+        anyhow::bail!("Invalid JSON block in FFmpeg loudnorm output");
+    }
+
+    let json_str = &stderr[json_start..=json_end];
+
+    // Parse the JSON to extract input_i (integrated loudness)
+    let json_value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse loudnorm JSON: {} — raw: {}", e, json_str))?;
+
+    let input_i_str = json_value.get("input_i")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No 'input_i' field in loudnorm JSON output"))?;
+
+    let lufs: f64 = input_i_str.parse()
+        .map_err(|e| anyhow::anyhow!("Failed to parse input_i '{}' as f64: {}", input_i_str, e))?;
+
+    Ok(lufs)
+}
+
+/// Calculate the gain adjustment (in dB) to apply to the microphone stream
+/// so it matches the system audio loudness level.
+///
+/// This enables pre-merge volume balancing: when the mic is much quieter than
+/// system audio (common in meetings), this function computes how much to boost
+/// the mic so both streams have comparable perceived loudness.
+///
+/// Safety guards:
+/// - Silent mic (< -50 LUFS): returns 0.0 to avoid amplifying noise floor
+/// - Silent system (< -50 LUFS): returns 0.0 (nothing to match against)
+/// - Gain clamped to [-6.0, +20.0] dB range
+/// - Dead zone: returns 0.0 if gain magnitude < 1.0 dB (already balanced)
+pub fn calculate_mic_gain_db(loopback_lufs: f64, mic_lufs: f64) -> f64 {
+    // Silent mic guard — avoid amplifying noise floor
+    if mic_lufs < -50.0 {
+        return 0.0;
+    }
+    // Silent system audio — nothing to match against
+    if loopback_lufs < -50.0 {
+        return 0.0;
+    }
+
+    let gain = loopback_lufs - mic_lufs;
+
+    // Clamp to safe range: modest attenuation (-6 dB) to generous boost (+20 dB)
+    let gain = gain.clamp(-6.0, 20.0);
+
+    // Dead zone: skip if already close enough
+    if gain.abs() < 1.0 {
+        return 0.0;
+    }
+
+    gain
+}
+
 /// Convert WAV file to M4A using optimized software AAC encoding
 pub async fn convert_wav_to_m4a_optimized(
     wav_path: &PathBuf,
@@ -841,4 +932,89 @@ pub async fn convert_wav_to_m4a_with_progress(
     tracing::info!("    Speed (MB/min):  {:.2}", (wav_size_mb / elapsed.as_secs_f64()) * 60.0);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mic_quieter_than_system_returns_positive_gain() {
+        // Typical meeting scenario: system audio at -12 LUFS, mic at -30 LUFS
+        // Expected: boost mic by 18 dB to match system level
+        let gain = calculate_mic_gain_db(-12.0, -30.0);
+        assert_eq!(gain, 18.0);
+    }
+
+    #[test]
+    fn mic_louder_than_system_capped_at_negative_six() {
+        // Mic is 12 dB louder than system → raw gain would be -12, capped at -6.0
+        let gain = calculate_mic_gain_db(-20.0, -8.0);
+        assert_eq!(gain, -6.0);
+    }
+
+    #[test]
+    fn similar_levels_within_one_db_returns_zero() {
+        // Levels within 1 dB of each other → dead zone, no adjustment needed
+        let gain = calculate_mic_gain_db(-14.0, -14.5);
+        assert_eq!(gain, 0.0);
+    }
+
+    #[test]
+    fn silent_mic_returns_zero() {
+        // Mic below -50 LUFS → effectively silent, don't amplify noise floor
+        let gain = calculate_mic_gain_db(-12.0, -60.0);
+        assert_eq!(gain, 0.0);
+    }
+
+    #[test]
+    fn silent_system_returns_zero() {
+        // System audio below -50 LUFS → nothing to match against
+        let gain = calculate_mic_gain_db(-55.0, -20.0);
+        assert_eq!(gain, 0.0);
+    }
+
+    #[test]
+    fn extreme_difference_capped_at_positive_twenty() {
+        // 30 dB difference → raw gain would be 30, capped at +20.0
+        let gain = calculate_mic_gain_db(-10.0, -40.0);
+        assert_eq!(gain, 20.0);
+    }
+
+    /// Integration test for measure_lufs — requires FFmpeg installed.
+    /// Run with: cargo test -p audio-rec-core measure_lufs_returns_reasonable_value -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn measure_lufs_returns_reasonable_value() {
+        // Generate a short test WAV file with a 440Hz sine wave using FFmpeg
+        let test_wav = std::env::temp_dir().join("lufs_test_440hz.wav");
+
+        // Create a 2-second 440Hz sine wave WAV file
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.arg("-hide_banner")
+            .arg("-loglevel").arg("error")
+            .arg("-f").arg("lavfi")
+            .arg("-i").arg("sine=frequency=440:duration=2")
+            .arg("-ar").arg("48000")
+            .arg("-y")
+            .arg(&test_wav);
+
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
+
+        let output = cmd.output().await.expect("FFmpeg should be available");
+        assert!(output.status.success(), "Failed to create test WAV file");
+
+        // Measure LUFS
+        let lufs = measure_lufs(&test_wav).await
+            .expect("measure_lufs should succeed on a valid WAV file");
+
+        // Clean up
+        let _ = std::fs::remove_file(&test_wav);
+
+        // A 440Hz sine wave at full scale should be around -3 to -6 LUFS
+        // Any reasonable audio should be between -70 and 0 LUFS
+        assert!(lufs > -70.0 && lufs < 0.0,
+            "LUFS value {} should be between -70.0 and 0.0", lufs);
+    }
 }

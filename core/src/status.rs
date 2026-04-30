@@ -22,6 +22,13 @@ pub struct RecordingStatus {
     pub is_mic_muted: Option<bool>,
     pub ffmpeg_progress: Option<u8>,
     pub processing_speed: Option<String>,
+    // Process-specific capture fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_window: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

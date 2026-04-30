@@ -187,6 +187,12 @@ async fn handle_record_command(args: &[String], output: &UserOutput) -> Result<(
     let app = parse_flag_value(args, "--app", None);
     let app_window = parse_flag_value(args, "--app-window", None);
 
+    // Mutual exclusivity: --app and --app-window cannot both be specified
+    if app.is_some() && app_window.is_some() {
+        output.error("Cannot specify both --app and --app-window. Use --app for process name (e.g., Zoom.exe) or --app-window for window title (e.g., \"Zoom Meeting\"), but not both.");
+        std::process::exit(1);
+    }
+
     let options = RecordOptions {
         duration,
         audio_format,

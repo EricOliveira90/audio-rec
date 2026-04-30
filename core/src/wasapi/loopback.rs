@@ -25,7 +25,7 @@
 use anyhow::{Context, Result};
 use crate::audio_utils::{calculate_rms_f32, calculate_rms_i16, calculate_rms_i32};
 use crate::wasapi::capture_engine::{
-    detect_sample_format, f32_to_i16, i32_to_i16, SampleFormat, WriteErrorTracker,
+    detect_sample_format, f32_to_i16, i32_to_i16, LoopbackCapture, SampleFormat, WriteErrorTracker,
 };
 use hound::{WavSpec, WavWriter};
 use std::path::PathBuf;
@@ -438,5 +438,30 @@ impl WasapiLoopbackRecorder {
         }
 
         Ok(())
+    }
+}
+
+/// Implement LoopbackCapture trait for WasapiLoopbackRecorder.
+/// This is a purely additive change — all methods already exist on the struct.
+/// Delegates to the existing public methods.
+impl LoopbackCapture for WasapiLoopbackRecorder {
+    fn stop(&mut self) -> anyhow::Result<()> {
+        WasapiLoopbackRecorder::stop(self)
+    }
+
+    fn get_frames_captured(&self) -> u64 {
+        WasapiLoopbackRecorder::get_frames_captured(self)
+    }
+
+    fn has_audio_detected(&self) -> bool {
+        WasapiLoopbackRecorder::has_audio_detected(self)
+    }
+
+    fn get_sample_rate(&self) -> u32 {
+        WasapiLoopbackRecorder::get_sample_rate(self)
+    }
+
+    fn get_start_time(&self) -> Option<Instant> {
+        WasapiLoopbackRecorder::get_start_time(self)
     }
 }
