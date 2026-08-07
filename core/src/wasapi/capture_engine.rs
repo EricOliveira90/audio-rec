@@ -10,6 +10,7 @@
 //! All unsafe operations follow the same safety invariants documented in `loopback.rs`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 // ── LoopbackCapture trait ──
@@ -120,25 +121,49 @@ pub fn i32_to_i16(sample: i32) -> i16 {
 #[derive(Debug)]
 pub struct WriteErrorTracker {
     has_error: AtomicBool,
+    first_error: Mutex<Option<String>>,
 }
 
 impl WriteErrorTracker {
     pub fn new() -> Self {
         Self {
             has_error: AtomicBool::new(false),
+            first_error: Mutex::new(None),
         }
     }
 
     /// Record a write error. Logs on first occurrence.
     pub fn record_error(&self, err: &dyn std::fmt::Display) {
         if !self.has_error.swap(true, Ordering::Relaxed) {
-            tracing::warn!("Sample write error: {}. Recording may be incomplete.", err);
+            let message = err.to_string();
+            if let Ok(mut first_error) = self.first_error.lock() {
+                *first_error = Some(message.clone());
+            }
+            tracing::warn!("Sample write error: {}. Recording may be incomplete.", message);
         }
     }
 
     /// Check if any write errors occurred during recording.
     pub fn had_errors(&self) -> bool {
         self.has_error.load(Ordering::Relaxed)
+    }
+
+    pub fn ensure_complete(&self, stream_name: &str) -> anyhow::Result<()> {
+        if !self.had_errors() {
+            return Ok(());
+        }
+
+        let detail = self
+            .first_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+            .unwrap_or_else(|| "unknown write error".to_string());
+        anyhow::bail!(
+            "{} audio samples could not be written: {}. The recording is incomplete; raw tracks were retained for recovery",
+            stream_name,
+            detail
+        );
     }
 }
 
@@ -329,6 +354,19 @@ mod tests {
         tracker.record_error(&"error 1");
         tracker.record_error(&"error 2");
         assert!(tracker.had_errors());
+    }
+
+    #[test]
+    fn write_error_tracker_returns_capture_failure() {
+        let tracker = WriteErrorTracker::new();
+        tracker.record_error(&std::io::Error::from_raw_os_error(112));
+
+        let error = tracker
+            .ensure_complete("microphone")
+            .expect_err("disk write errors must fail the recording");
+
+        assert!(error.to_string().contains("microphone"));
+        assert!(error.to_string().contains("could not be written"));
     }
 
     // ── CaptureConfig ──

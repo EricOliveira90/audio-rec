@@ -676,10 +676,14 @@ async fn record_worker(
 
         // Stop both recorders
         let mut loopback_recorder = loopback_recorder;
-        loopback_recorder.stop()?;
-        if let Some(mut mic) = mic_recorder.take() {
-            mic.stop()?;
-        }
+        let loopback_stop_result = loopback_recorder.stop();
+        let mic_stop_result = if let Some(mut mic) = mic_recorder.take() {
+            mic.stop()
+        } else {
+            Ok(())
+        };
+        loopback_stop_result?;
+        mic_stop_result?;
 
         let actual_elapsed = start_time.elapsed().as_secs();
         tracing::info!("Recording completed after {}s, starting post-processing", actual_elapsed);

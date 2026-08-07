@@ -432,10 +432,6 @@ impl WasapiMicrophoneRecorder {
             }
         }
 
-        if self.write_errors.had_errors() {
-            tracing::warn!("Some audio samples could not be written during microphone recording");
-        }
-
-        Ok(())
+        self.write_errors.ensure_complete("Microphone")
     }
 }

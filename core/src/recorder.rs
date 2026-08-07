@@ -309,6 +309,7 @@ pub async fn merge_audio_streams_smart(
             let mut checkpoint_25_logged = false;
             let mut checkpoint_50_logged = false;
             let mut checkpoint_75_logged = false;
+            let mut ffmpeg_diagnostics = Vec::new();
 
             // Log estimated processing time at the start
             // Typical processing speed is 4-6x real-time for M4A encoding
@@ -319,6 +320,27 @@ pub async fn merge_audio_streams_smart(
             tracing::info!("    Audio duration: {}ms, Progress monitoring: ACTIVE", effective_duration_ms);
 
             while let Ok(Some(line)) = lines.next_line().await {
+                let is_progress_line = line
+                    .split_once('=')
+                    .map(|(key, _)| {
+                        matches!(
+                            key,
+                            "bitrate"
+                                | "total_size"
+                                | "out_time_us"
+                                | "out_time_ms"
+                                | "out_time"
+                                | "dup_frames"
+                                | "drop_frames"
+                                | "speed"
+                                | "progress"
+                        )
+                    })
+                    .unwrap_or(false);
+                if !is_progress_line {
+                    ffmpeg_diagnostics.push(line.clone());
+                }
+
                 if line.starts_with("out_time_ms=") {
                     if let Ok(time_us) = line.split('=').nth(1).unwrap_or("0").parse::<u64>() {
                         // IMPORTANT: FFmpeg's out_time_ms is actually in MICROSECONDS despite the name
@@ -408,7 +430,9 @@ pub async fn merge_audio_streams_smart(
                 }
             }
 
-            child.wait_with_output().await
+            let mut output = child.wait_with_output().await?;
+            output.stderr = ffmpeg_diagnostics.join("\n").into_bytes();
+            Ok(output)
         } else {
             cmd.output().await
         }
