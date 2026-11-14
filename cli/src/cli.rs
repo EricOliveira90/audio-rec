@@ -286,7 +286,9 @@ fn print_usage() {
     println!("JSON PROTOCOL (stdout):");
     println!("  All output is JSON, one object per line (events emitted only on state changes):");
     println!("  {{\"type\": \"started\", \"session_id\": \"...\", \"file_path\": \"...\"}}");
-    println!("  {{\"type\": \"audio_state\", \"loopback_has_audio\": true, \"mic_has_audio\": false, \"is_mic_muted\": false}}");
+    println!("  {{\"type\": \"audio_state\", \"loopback_has_audio\": true, \"mic_has_audio\": false, \"is_mic_muted\": false,");
+    println!("   \"loopback_device_lost\": false, \"mic_device_lost\": false, \"device_recoveries\": 0}}");
+    println!("  {{\"type\": \"warning\", \"code\": \"device_lost\" | \"device_recovered\" | \"process_exited\", \"message\": \"...\"}}");
     println!("  {{\"type\": \"muted\", \"is_muted\": true}}");
     println!("  {{\"type\": \"completed\", \"file_path\": \"...\", \"file_size_mb\": \"2.34\"}}");
     println!("  {{\"type\": \"error\", \"message\": \"...\"}}");

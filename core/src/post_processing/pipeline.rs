@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::domain::AudioFormat;
-use crate::recorder::RecordingQuality;
+use crate::recorder::{AudioAlignment, RecordingQuality};
 use crate::status::JsonFileObserver;
 
 /// Configuration for which pipeline stages are enabled
@@ -83,6 +83,7 @@ pub struct PostProcessingPipeline {
     output_path: PathBuf,
     loopback_has_audio: bool,
     mic_has_audio: bool,
+    alignment: AudioAlignment,
     observer: Option<Arc<JsonFileObserver>>,
     event_emitter: Option<EventEmitter>,
 }
@@ -96,6 +97,7 @@ impl PostProcessingPipeline {
         output_path: PathBuf,
         loopback_has_audio: bool,
         mic_has_audio: bool,
+        alignment: AudioAlignment,
     ) -> Self {
         Self {
             config,
@@ -105,6 +107,7 @@ impl PostProcessingPipeline {
             output_path,
             loopback_has_audio,
             mic_has_audio,
+            alignment,
             observer: None,
             event_emitter: None,
         }
@@ -228,7 +231,7 @@ impl PostProcessingPipeline {
             Some(&self.session_id),
             self.observer.clone(),
             self.total_stages(),
-            0, // No start offset available in pipeline context
+            &self.alignment
         )
         .await?;
 
@@ -381,6 +384,7 @@ mod tests {
             PathBuf::from("/tmp/output.wav"),
             true,
             true,
+            AudioAlignment::none("pipeline test"),
         );
         assert_eq!(pipeline.total_stages(), 6);
     }
@@ -397,6 +401,7 @@ mod tests {
             PathBuf::from("/tmp/output.wav"),
             true,
             false,
+            AudioAlignment::none("pipeline test"),
         );
         let stages = pipeline.active_stages();
         assert!(!stages.contains(&"normalizing"));
@@ -420,6 +425,7 @@ mod tests {
             PathBuf::from("/tmp/output.wav"),
             true,
             true,
+            AudioAlignment::none("pipeline test"),
         )
         .with_event_emitter(Box::new(move |stage, message| {
             events_clone.lock().unwrap().push((stage.to_string(), message.to_string()));

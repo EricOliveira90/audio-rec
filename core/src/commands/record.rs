@@ -9,7 +9,7 @@ use crate::config::RecorderConfig;
 use crate::domain::{AudioFormat, RecordingDuration, RecordingSession};
 use crate::error::Result;
 use crate::output::UserOutput;
-use crate::recorder::{merge_audio_streams_smart, RecordingQuality};
+use crate::recorder::{merge_audio_streams_smart, AudioAlignment, RecordingQuality};
 use crate::status::{JsonFileObserver, RecordingResult, RecordingStatus, StatusObserver};
 
 #[cfg(windows)]
@@ -113,7 +113,25 @@ pub async fn execute_with_output(
     let session = RecordingSession::new(options.audio_format, options.quality.clone(), options.duration);
 
     // Determine final output path
-    let final_output_path = if let Some(ref path) = options.output_path {
+    // Fix invalid filenames now, not after the recording: the final copy is the last step.
+    let requested_output_path = options.output_path.as_ref().map(|path| {
+        match sanitize_output_file_name(path) {
+            Some(cleaned) => {
+                output.warning(format!(
+                    "Output name {:?} has characters Windows does not allow in filenames. Saving as {:?}",
+                    path, cleaned
+                ));
+                cleaned
+            }
+            None => path.clone(),
+        }
+    });
+
+    let final_output_path = if let Some(ref path) = requested_output_path.as_ref().filter(|p| p.is_dir()) {
+        // User passed a directory: copying onto a directory fails with "Access is denied"
+        // on Windows, so put the auto-generated filename inside it.
+        path.join(session.filename())
+    } else if let Some(ref path) = requested_output_path {
         // User specified a path — ensure parent directory exists
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -210,6 +228,171 @@ async fn wait_for_file_ready(path: &std::path::PathBuf, timeout_ms: u64) -> Resu
     }
 }
 
+/// Characters Windows does not allow in a file name. A ':' is the worst one: NTFS reads
+/// "a:b.wav" as alternate data stream "b.wav" on file "a". The final copy then fails
+/// with "Access is denied", but only after the whole recording has been processed.
+const INVALID_FILE_NAME_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// Returns a path with invalid file name characters replaced by '-', and trailing dots
+/// and spaces removed. Returns `None` if the file name is already valid.
+/// Only the last path component is changed, so a drive prefix such as "C:" is kept.
+fn sanitize_output_file_name(path: &std::path::Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let replaced: String = name
+        .chars()
+        .map(|c| if INVALID_FILE_NAME_CHARS.contains(&c) || c.is_control() { '-' } else { c })
+        .collect();
+    let cleaned = replaced.trim_end_matches(['.', ' ']);
+    if cleaned == name || cleaned.is_empty() {
+        return None;
+    }
+    Some(path.with_file_name(cleaned))
+}
+
+/// Copy the processed temporary file to its official destination, then remove it.
+/// A successful return guarantees there is no second merged output left behind.
+fn finalize_output(merge_output_path: &PathBuf, final_output_path: &PathBuf) -> Result<()> {
+    if let Some(parent) = final_output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    // Rename first: on the same volume it needs no extra disk space. A full-size copy
+    // here once doubled the space a long recording needed at its peak.
+    if std::fs::rename(merge_output_path, final_output_path).is_ok() {
+        return Ok(());
+    }
+
+    // Rename fails across drives, so copy then remove.
+    // On failure the processed file stays in place, so name both paths for recovery.
+    std::fs::copy(merge_output_path, final_output_path).map_err(|error| {
+        anyhow::anyhow!(
+            "Could not write final recording to {} ({}). The processed recording is kept at {}",
+            final_output_path.display(),
+            error,
+            merge_output_path.display()
+        )
+    })?;
+    std::fs::remove_file(merge_output_path)?;
+
+    Ok(())
+}
+
+fn finalize_recording_files(
+    merge_output_path: &PathBuf,
+    final_output_path: &PathBuf,
+    raw_tracks: &[&PathBuf],
+) -> Result<()> {
+    finalize_output(merge_output_path, final_output_path)?;
+    for raw_track in raw_tracks {
+        match std::fs::remove_file(raw_track) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Warns at recording start when the recordings drive may not hold the whole recording
+/// (raw tracks + merge + optional trim). Indefinite recordings are checked for one hour.
+#[cfg(windows)]
+fn warn_if_disk_space_low(
+    session: &RecordingSession,
+    config: &RecorderConfig,
+    trim_silence: bool,
+    output: &UserOutput,
+) {
+    use crate::disk_space;
+
+    let Some(free) = disk_space::available_bytes(&config.recordings_dir) else {
+        return;
+    };
+    let planned_secs = match session.duration.effective_duration() {
+        0 => disk_space::INDEFINITE_ESTIMATE_SECS,
+        secs => secs,
+    };
+    let needed = disk_space::estimate_recording_peak_bytes(
+        planned_secs,
+        session.quality.sample_rate,
+        session.quality.channels,
+        matches!(session.format, AudioFormat::M4a),
+        trim_silence,
+    );
+    tracing::info!(
+        "Disk space: {} free in {:?}, about {} needed for {} min",
+        disk_space::format_mb(free),
+        config.recordings_dir,
+        disk_space::format_mb(needed),
+        planned_secs / 60
+    );
+    if free < needed {
+        output.warning(format!(
+            "Low disk space: {} free on the recordings drive, but a {}-minute recording needs about {}. \
+             Free up space now, or the recording may fail when it is saved.",
+            disk_space::format_mb(free),
+            planned_secs / 60,
+            disk_space::format_mb(needed)
+        ));
+    }
+}
+
+/// Returns an error before the merge starts if the recordings drive cannot hold the
+/// merged output (and the trimmed copy, when trimming is on). The raw tracks are kept,
+/// so the recording can be merged again after the user frees space.
+#[cfg(windows)]
+fn ensure_space_for_post_processing(
+    session: &RecordingSession,
+    config: &RecorderConfig,
+    raw_tracks: &[&PathBuf],
+    alignment: &AudioAlignment,
+    trim_silence: bool,
+) -> Result<()> {
+    use crate::disk_space;
+
+    let Some(free) = disk_space::available_bytes(&config.recordings_dir) else {
+        tracing::warn!("Could not read free disk space; skipping the pre-merge space check");
+        return Ok(());
+    };
+    let longest_track_secs = raw_tracks
+        .iter()
+        .filter_map(|path| hound::WavReader::open(path).ok())
+        .map(|reader| {
+            let rate = reader.spec().sample_rate.max(1);
+            f64::from(reader.duration()) / f64::from(rate)
+        })
+        .fold(0.0_f64, f64::max);
+    let output_secs = longest_track_secs + alignment.start_offset_seconds().abs();
+    let merged = disk_space::estimate_merged_output_bytes(
+        output_secs,
+        session.quality.sample_rate,
+        session.quality.channels,
+        matches!(session.format, AudioFormat::M4a),
+    );
+    let needed = disk_space::required_post_processing_bytes(merged, trim_silence);
+    tracing::info!(
+        "Pre-merge disk check: {} free, {} needed ({:.0} s of audio, trim: {})",
+        disk_space::format_mb(free),
+        disk_space::format_mb(needed),
+        output_secs,
+        trim_silence
+    );
+    if free >= needed {
+        return Ok(());
+    }
+
+    let kept: Vec<String> = raw_tracks.iter().map(|p| p.display().to_string()).collect();
+    Err(crate::error::RecorderError::Other(anyhow::anyhow!(
+        "Not enough disk space to save the recording: {} free on the drive of {}, but the merge needs about {}. \
+         Nothing was lost: the raw tracks are kept at {}. Free up space, then merge them again.",
+        disk_space::format_mb(free),
+        config.recordings_dir.display(),
+        disk_space::format_mb(needed),
+        kept.join(" and ")
+    )))
+}
+
 async fn record_worker(
     session: RecordingSession,
     config: RecorderConfig,
@@ -250,6 +433,8 @@ async fn record_worker(
             "{}_mic.wav",
             session.id.as_str()
         ));
+
+        warn_if_disk_space_low(&session, &config, trim_silence, &output);
 
         // Determine capture mode: process-specific or system-wide
         let mut capture_mode: String;
@@ -447,6 +632,9 @@ async fn record_worker(
         let mut prev_loopback_has_audio = loopback_recorder.has_audio_detected();
         let mut prev_mic_has_audio = mic_recorder.as_ref().map(|m| m.has_audio_detected());
         let mut prev_mic_muted = is_mic_muted.load(Ordering::Relaxed);
+        let mut prev_loopback_device_lost = false;
+        let mut prev_mic_device_lost: Option<bool> = mic_recorder.as_ref().map(|_| false);
+        let mut prev_device_recoveries: u64 = 0;
 
         // Check for signals and state changes every second
         let check_interval = config.signal_check_interval;
@@ -582,10 +770,46 @@ async fn record_worker(
             let cur_loopback_has_audio = loopback_recorder.has_audio_detected();
             let cur_mic_has_audio = mic_recorder.as_ref().map(|m| m.has_audio_detected());
             let cur_mic_muted = is_mic_muted.load(Ordering::Relaxed);
+            // Device health: a lost device is being rebuilt by its capture thread.
+            // Surface it live so a dead stream is never hidden until stop.
+            let cur_loopback_device_lost = loopback_recorder.is_device_lost();
+            let cur_mic_device_lost = mic_recorder.as_ref().map(|m| m.is_device_lost());
+            let cur_device_recoveries = loopback_recorder.device_recoveries()
+                + mic_recorder.as_ref().map(|m| m.device_recoveries()).unwrap_or(0);
+
+            for (stream, was_lost, is_lost) in [
+                ("system audio", prev_loopback_device_lost, cur_loopback_device_lost),
+                (
+                    "microphone",
+                    prev_mic_device_lost.unwrap_or(false),
+                    cur_mic_device_lost.unwrap_or(false),
+                ),
+            ] {
+                if is_lost && !was_lost {
+                    emit_event(&json!({
+                        "type": "warning",
+                        "session_id": session.id.as_str(),
+                        "code": "device_lost",
+                        "message": format!("The {} device was lost. Reconnecting; silence is recorded until it is back.", stream)
+                    }));
+                    output.warning(&format!("{} device lost - reconnecting...", stream));
+                } else if was_lost && !is_lost {
+                    emit_event(&json!({
+                        "type": "warning",
+                        "session_id": session.id.as_str(),
+                        "code": "device_recovered",
+                        "message": format!("The {} device is back. Recording resumed.", stream)
+                    }));
+                    output.prefixed("Recovery", &format!("{} device reconnected, recording resumed", stream));
+                }
+            }
 
             let state_changed = cur_loopback_has_audio != prev_loopback_has_audio
                 || cur_mic_has_audio != prev_mic_has_audio
-                || cur_mic_muted != prev_mic_muted;
+                || cur_mic_muted != prev_mic_muted
+                || cur_loopback_device_lost != prev_loopback_device_lost
+                || cur_mic_device_lost != prev_mic_device_lost
+                || cur_device_recoveries != prev_device_recoveries;
 
             if state_changed {
                 emit_event(&json!({
@@ -595,6 +819,9 @@ async fn record_worker(
                     "mic_has_audio": cur_mic_has_audio,
                     "is_mic_muted": cur_mic_muted,
                     "capture_mode": &capture_mode,
+                    "loopback_device_lost": cur_loopback_device_lost,
+                    "mic_device_lost": cur_mic_device_lost,
+                    "device_recoveries": cur_device_recoveries,
                 }));
 
                 // Calculate progress for status file
@@ -638,6 +865,9 @@ async fn record_worker(
                 prev_loopback_has_audio = cur_loopback_has_audio;
                 prev_mic_has_audio = cur_mic_has_audio;
                 prev_mic_muted = cur_mic_muted;
+                prev_loopback_device_lost = cur_loopback_device_lost;
+                prev_mic_device_lost = cur_mic_device_lost;
+                prev_device_recoveries = cur_device_recoveries;
             }
         }
 
@@ -648,38 +878,22 @@ async fn record_worker(
             .map(|m| m.has_audio_detected())
             .unwrap_or(false);
 
-        // Capture start times for desync compensation before stopping
-        let loopback_start = loopback_recorder.get_start_time();
-        let mic_start = mic_recorder.as_ref().and_then(|m| m.get_start_time());
-
-        // Compute the start offset: positive = loopback started first (common case)
-        let start_offset_ms = match (loopback_start, mic_start) {
-            (Some(lb), Some(mic)) => {
-                if lb <= mic {
-                    // Loopback started first (normal): positive offset
-                    mic.duration_since(lb).as_millis() as i64
-                } else {
-                    // Mic started first (rare): negative offset
-                    -(lb.duration_since(mic).as_millis() as i64)
-                }
-            }
-            _ => 0, // One or both start times unavailable, no compensation
-        };
-
-        if start_offset_ms != 0 {
-            tracing::info!(
-                "⏱️  Start time offset: {} ms ({})",
-                start_offset_ms.abs(),
-                if start_offset_ms > 0 { "loopback started first" } else { "mic started first" }
-            );
-        }
-
-        // Stop both recorders
+        // Stop and finalize both writers before taking immutable timing snapshots.
         let mut loopback_recorder = loopback_recorder;
-        loopback_recorder.stop()?;
-        if let Some(mut mic) = mic_recorder.take() {
-            mic.stop()?;
-        }
+        let loopback_stop_result = loopback_recorder.stop();
+        let loopback_timing = loopback_recorder.capture_timing();
+        let (mic_stop_result, mic_timing) = if let Some(mut mic) = mic_recorder.take() {
+            let stop_result = mic.stop();
+            (stop_result, Some(mic.capture_timing()))
+        } else {
+            (Ok(()), None)
+        };
+        loopback_stop_result?;
+        mic_stop_result?;
+        let alignment = mic_timing
+            .as_ref()
+            .map(|timing| AudioAlignment::from_captures(&loopback_timing, timing))
+            .unwrap_or_else(|| AudioAlignment::none("microphone capture unavailable"));
 
         let actual_elapsed = start_time.elapsed().as_secs();
         tracing::info!("Recording completed after {}s, starting post-processing", actual_elapsed);
@@ -742,6 +956,16 @@ async fn record_worker(
             config.recordings_dir.join(format!("{}_merged.wav", session.id.as_str()))
         };
 
+        // Fail before FFmpeg starts if the merge cannot fit on disk. Otherwise FFmpeg
+        // writes for minutes, then dies with ENOSPC and leaves a truncated file.
+        ensure_space_for_post_processing(
+            &session,
+            &config,
+            &[&loopback_temp, &mic_temp],
+            &alignment,
+            trim_silence,
+        )?;
+
         // Merge audio channels (and encode to M4A if requested)
         {
             // Use saved values (mic_recorder was already taken above)
@@ -770,7 +994,7 @@ async fn record_worker(
                     Some(session.id.as_str()),
                     Some(observer.clone()),
                     total_steps,
-                    start_offset_ms,
+                    &alignment,
                 )
                 .await?;
 
@@ -786,10 +1010,6 @@ async fn record_worker(
             .await?;
         }
 
-        // Cleanup temporary recording files
-        let _ = std::fs::remove_file(&loopback_temp);
-        let _ = std::fs::remove_file(&mic_temp);
-        tracing::info!("Temporary recording files cleaned up");
 
         // Clean up stale mute signal
         let mute_signal = config.signals_dir.join(format!("{}.mute", session.id.as_str()));
@@ -816,35 +1036,12 @@ async fn record_worker(
             tracing::info!("Silence trimming completed");
         }
 
-        // Move the processed file to the final output path
-        if let Some(parent) = final_output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        // Copy then remove (works across drives, unlike rename)
-        std::fs::copy(&merge_output_path, &final_output_path)?;
-
-        // Keep the pre-trim merged file for debugging desync issues.
-        // Stored alongside the final output with a _merged suffix so the user
-        // can compare the merged (pre-trim) vs final (post-trim) audio.
-        let debug_merged_path = {
-            let stem = final_output_path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("recording");
-            let ext = final_output_path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("wav");
-            final_output_path.with_file_name(format!("{}_merged.{}", stem, ext))
-        };
-        if let Err(e) = std::fs::copy(&merge_output_path, &debug_merged_path) {
-            tracing::warn!("Could not save debug merged file: {}", e);
-        } else {
-            tracing::info!("Debug pre-trim merged file saved to: {:?}", debug_merged_path);
-        }
-
-        let _ = std::fs::remove_file(&merge_output_path);
+        finalize_recording_files(
+            &merge_output_path,
+            &final_output_path,
+            &[&loopback_temp, &mic_temp],
+        )?;
+        tracing::info!("Temporary recording files cleaned up");
 
         tracing::info!("Final file saved to: {:?}", final_output_path);
         }
@@ -904,4 +1101,84 @@ async fn record_worker(
         duration_secs = duration_secs
     ))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sanitize_replaces_colon_in_file_name() {
+        let cleaned = sanitize_output_file_name(std::path::Path::new("2026-11-07_1:1_Nic.wav"));
+        assert_eq!(cleaned, Some(PathBuf::from("2026-11-07_1-1_Nic.wav")));
+    }
+
+    #[test]
+    fn sanitize_keeps_drive_prefix_and_valid_names() {
+        assert_eq!(sanitize_output_file_name(std::path::Path::new(r"C:\rec\meeting.wav")), None);
+        assert_eq!(
+            sanitize_output_file_name(std::path::Path::new(r"C:\rec\a?b.wav")),
+            Some(PathBuf::from(r"C:\rec\a-b.wav"))
+        );
+    }
+
+    #[test]
+    fn finalize_output_keeps_only_official_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_dir = std::env::current_dir()
+            .unwrap()
+            .join("target/test-artifacts")
+            .join(format!("audio-rec-finalize-{unique}"));
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let merged = test_dir.join("session_merged.wav");
+        let official = test_dir.join("recording.wav");
+        std::fs::write(&merged, b"recording data").unwrap();
+
+        finalize_output(&merged, &official).unwrap();
+
+        assert!(official.exists());
+        assert!(!merged.exists());
+        assert_eq!(std::fs::read(&official).unwrap(), b"recording data");
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+    #[test]
+    fn failed_finalization_retains_raw_tracks_for_recovery() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_dir = std::env::current_dir()
+            .unwrap()
+            .join("target/test-artifacts")
+            .join(format!("audio-rec-recovery-{unique}"));
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let missing_merged = test_dir.join("missing_merged.wav");
+        let official = test_dir.join("recording.wav");
+        let loopback = test_dir.join("loopback.wav");
+        let microphone = test_dir.join("microphone.wav");
+        std::fs::write(&loopback, b"loopback recovery data").unwrap();
+        std::fs::write(&microphone, b"microphone recovery data").unwrap();
+
+        let result = finalize_recording_files(
+            &missing_merged,
+            &official,
+            &[&loopback, &microphone],
+        );
+
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("recording.wav"), "{message}");
+        assert!(message.contains("missing_merged.wav"), "{message}");
+        assert!(loopback.exists());
+        assert!(microphone.exists());
+        assert!(!official.exists());
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
 }

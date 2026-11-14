@@ -567,26 +567,16 @@ pub async fn trim_silence(
     tracing::info!("    Threshold:          {} dB", silence_threshold_db);
     tracing::info!("    Max internal gap:   {}s", max_internal_silence_secs);
 
-    // Build FFmpeg command with silenceremove filter
-    // The filter works in two passes:
-    // 1. Remove leading silence (start_periods=1)
-    // 2. Remove trailing silence (stop_periods=-1)
-    // 3. Cap internal silence via stop_duration parameter
-    //
-    // silenceremove parameters:
-    // - start_periods=1: remove silence from the beginning (1 period of non-silence starts output)
-    // - start_duration=0: don't keep any leading silence
-    // - start_threshold: amplitude threshold below which is considered silence
-    // - stop_periods=-1: remove silence from the end (process entire file, remove trailing)
-    // - stop_duration: keep this much silence between non-silent sections (caps internal gaps)
-    // - stop_threshold: same threshold for trailing/internal silence detection
+    // First remove leading silence and cap long internal gaps. A reverse pass is
+    // required for trailing silence shorter than the internal-gap threshold.
     let filter = format!(
-        "silenceremove=start_periods=1:start_duration=0:start_threshold={}dB:stop_periods=-1:stop_duration={}:stop_threshold={}dB",
+        "silenceremove=start_periods=1:start_duration=0:start_threshold={}dB:stop_periods=-1:stop_duration={}:stop_threshold={}dB:stop_silence={},areverse,silenceremove=start_periods=1:start_duration=0:start_threshold={}dB,areverse",
+        silence_threshold_db,
+        max_internal_silence_secs,
         silence_threshold_db,
         max_internal_silence_secs,
         silence_threshold_db
     );
-
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-hide_banner")
         .arg("-loglevel").arg("error")
