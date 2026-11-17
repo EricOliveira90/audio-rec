@@ -89,15 +89,20 @@ The device drop happened on the notebook, so test there too:
 
 1. Start a recording: `audio-rec record -o test-device-loss.wav`
 2. Play some audio (a video) and talk for 30 seconds.
-3. Change the default playback device in Windows sound settings, or
-   disconnect and reconnect your headset. Wait 30 seconds, still playing and
-   talking.
+3. Drop the audio device. In PowerShell **as Administrator**, run
+   `Restart-Service -Name Audiosrv -Force` (the sound cuts out for a few
+   seconds). Or, if your headset was the default device before step 1, turn
+   it off for 15 seconds and back on. Changing the default device in Windows
+   settings does **not** trigger the bug: Windows keeps the old stream alive.
+   Wait 30 seconds, still playing and talking.
 4. Stop the recording: `audio-rec stop` in a second window.
 
 It worked when:
 
 - the terminal shows `device lost - reconnecting...`, then
   `device reconnected, recording resumed`;
+- if the video goes quiet after the drop, pause and play it again: the
+  player lost its stream too, which is Windows behaviour, not the recorder;
 - the log shows `recording resumed`;
 - `ffprobe test-device-loss.wav` shows a length close to how long you
   recorded, with sound after the device switch.
