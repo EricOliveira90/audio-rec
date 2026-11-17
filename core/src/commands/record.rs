@@ -418,7 +418,8 @@ async fn record_worker(
         // both streams ran to the end. Drives the final message and event.
         #[allow(unused_mut)]
         let mut stream_failures: Vec<String> = Vec::new();
-        // How many times a lost device was rebuilt; each left a few silent seconds.
+        // Device drops that recovered, counted per stream and taking the larger, since
+        // one drop (an audio service restart, a headset) usually hits both streams.
         #[allow(unused_mut)]
         let mut total_device_recoveries: u64 = 0;
 
@@ -922,7 +923,7 @@ async fn record_worker(
                 "the system audio device was still disconnected when the recording stopped".to_string(),
             );
         }
-        total_device_recoveries += loopback_recorder.device_recoveries();
+        total_device_recoveries = total_device_recoveries.max(loopback_recorder.device_recoveries());
         let (mic_stop_result, mic_timing) = if let Some(mut mic) = mic_recorder.take() {
             let stop_result = mic.stop();
             stream_failures.extend(mic.capture_failure());
@@ -931,7 +932,7 @@ async fn record_worker(
                     "the microphone was still disconnected when the recording stopped".to_string(),
                 );
             }
-            total_device_recoveries += mic.device_recoveries();
+            total_device_recoveries = total_device_recoveries.max(mic.device_recoveries());
             (stop_result, Some(mic.capture_timing()))
         } else {
             (Ok(()), None)
