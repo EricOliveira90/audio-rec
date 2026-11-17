@@ -2,6 +2,7 @@ pub mod audio_processing;
 pub mod audio_utils;
 pub mod commands;
 pub mod config;
+pub mod disk_space;
 pub mod domain;
 pub mod error;
 pub mod ffmpeg_encoder;

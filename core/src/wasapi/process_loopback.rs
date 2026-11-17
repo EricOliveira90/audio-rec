@@ -18,7 +18,8 @@
 use anyhow::{Context, Result};
 use crate::audio_utils::{calculate_rms_f32, calculate_rms_i16, calculate_rms_i32};
 use crate::wasapi::capture_engine::{
-    detect_sample_format, f32_to_i16, i32_to_i16, LoopbackCapture, SampleFormat, WriteErrorTracker,
+    detect_sample_format, f32_to_i16, i32_to_i16, CaptureTiming, LoopbackCapture, SampleFormat,
+    WriteErrorTracker,
 };
 use hound::{WavSpec, WavWriter};
 use std::path::PathBuf;
@@ -124,6 +125,7 @@ pub struct ProcessLoopbackRecorder {
     has_audio: Arc<AtomicBool>,
     sample_rate: u32,
     start_time: Arc<Mutex<Option<Instant>>>,
+    capture_timing: Arc<Mutex<CaptureTiming>>,
     thread_handle: Option<std::thread::JoinHandle<Result<()>>>,
     write_errors: Arc<WriteErrorTracker>,
     /// Set to true when the target process exits during recording
@@ -145,6 +147,7 @@ impl ProcessLoopbackRecorder {
         let has_audio = Arc::new(AtomicBool::new(false));
         let write_errors = Arc::new(WriteErrorTracker::new());
         let start_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let capture_timing = Arc::new(Mutex::new(CaptureTiming::new(0)));
         let process_dead = Arc::new(AtomicBool::new(false));
 
         // Eagerly activate process loopback on the calling thread.
@@ -208,6 +211,7 @@ impl ProcessLoopbackRecorder {
         let has_audio_clone = Arc::clone(&has_audio);
         let write_errors_clone = Arc::clone(&write_errors);
         let start_time_clone = Arc::clone(&start_time);
+        let capture_timing_clone = Arc::clone(&capture_timing);
         let process_dead_clone = Arc::clone(&process_dead);
 
         let handle = std::thread::spawn(move || {
@@ -219,6 +223,7 @@ impl ProcessLoopbackRecorder {
                 has_audio_clone,
                 write_errors_clone,
                 start_time_clone,
+                capture_timing_clone,
                 process_dead_clone,
                 sendable_client,
             )
@@ -230,6 +235,7 @@ impl ProcessLoopbackRecorder {
             has_audio,
             sample_rate,
             start_time,
+            capture_timing,
             thread_handle: Some(handle),
             write_errors,
             process_dead,
@@ -245,6 +251,7 @@ impl ProcessLoopbackRecorder {
         has_audio: Arc<AtomicBool>,
         write_errors: Arc<WriteErrorTracker>,
         start_time: Arc<Mutex<Option<Instant>>>,
+        capture_timing: Arc<Mutex<CaptureTiming>>,
         process_dead: Arc<AtomicBool>,
         sendable_client: SendableAudioClient,
     ) -> Result<()> {
@@ -293,8 +300,13 @@ impl ProcessLoopbackRecorder {
 
             audio_client.Start()?;
 
+            let capture_start = Instant::now();
             if let Ok(mut st) = start_time.lock() {
-                *st = Some(Instant::now());
+                *st = Some(capture_start);
+            }
+            if let Ok(mut timing) = capture_timing.lock() {
+                timing.set_sample_rate(sample_rate);
+                timing.set_start_time(capture_start);
             }
 
             tracing::info!("Process loopback recording started for PID {}", pid);
@@ -331,13 +343,16 @@ impl ProcessLoopbackRecorder {
                     let mut buffer: *mut u8 = std::ptr::null_mut();
                     let mut num_frames = 0u32;
                     let mut flags = 0u32;
+                    let mut device_position = 0u64;
+                    let mut qpc_100ns = 0u64;
+                    let wav_frame = total_frames_written;
 
                     match capture_client.GetBuffer(
                         &mut buffer,
                         &mut num_frames,
                         &mut flags,
-                        None,
-                        None,
+                        Some(&mut device_position),
+                        Some(&mut qpc_100ns),
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -345,6 +360,10 @@ impl ProcessLoopbackRecorder {
                             process_dead.store(true, Ordering::Relaxed);
                             break;
                         }
+                    }
+
+                    if let Ok(mut timing) = capture_timing.lock() {
+                        timing.record_packet(wav_frame, device_position, qpc_100ns, flags);
                     }
 
                     if num_frames > 0 {
@@ -666,6 +685,12 @@ impl ProcessLoopbackRecorder {
     pub fn get_start_time(&self) -> Option<Instant> {
         self.start_time.lock().ok().and_then(|guard| *guard)
     }
+    pub(crate) fn capture_timing(&self) -> CaptureTiming {
+        self.capture_timing
+            .lock()
+            .map(|timing| timing.snapshot())
+            .unwrap_or_else(|_| CaptureTiming::new(self.sample_rate))
+    }
 
     pub fn stop(&mut self) -> Result<()> {
         self.is_recording.store(false, Ordering::Relaxed);
@@ -675,20 +700,15 @@ impl ProcessLoopbackRecorder {
             loop {
                 if handle.is_finished() {
                     match handle.join() {
-                        Ok(result) => {
-                            if let Err(e) = result {
-                                tracing::error!("Process loopback recording thread error: {}", e);
-                            }
-                        }
+                        Ok(result) => result?,
                         Err(_) => {
-                            tracing::error!("Process loopback recording thread panicked");
+                            return Err(anyhow::anyhow!("Process loopback recording thread panicked"));
                         }
                     }
                     break;
                 }
                 if start.elapsed() >= STOP_TIMEOUT {
-                    tracing::warn!("Process loopback recording thread did not finish within {:?}, continuing", STOP_TIMEOUT);
-                    break;
+                    return Err(anyhow::anyhow!("Process loopback recording thread did not finish within {:?}", STOP_TIMEOUT));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -718,6 +738,9 @@ impl LoopbackCapture for ProcessLoopbackRecorder {
 
     fn get_start_time(&self) -> Option<Instant> {
         ProcessLoopbackRecorder::get_start_time(self)
+    }
+    fn capture_timing(&self) -> CaptureTiming {
+        ProcessLoopbackRecorder::capture_timing(self)
     }
 
     fn is_process_dead(&self) -> bool {

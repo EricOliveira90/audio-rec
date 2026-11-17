@@ -15,6 +15,11 @@
 *.ogg
 *.m4a
 
+# Local diagnostic and Python cache artifacts
+/sync-diagnostics/
+__pycache__/
+*.py[cod]
+
 # Debug symbols
 *.pdb
 

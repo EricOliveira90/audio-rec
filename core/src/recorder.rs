@@ -11,6 +11,171 @@ const PROFESSIONAL_CHANNELS: u16 = 2;
 const PROFESSIONAL_BYTES_PER_SECOND: u64 = 192_000;
 const DEFAULT_DURATION_FALLBACK_MS: u64 = 300_000; // 5 minutes
 const DURATION_ESTIMATE_BUFFER_FACTOR: f64 = 1.2; // 20% buffer to prevent premature 100%
+const MIN_DRIFT_FIT_SECONDS: f64 = 30.0;
+const MAX_RELATIVE_RATE_PPM: f64 = 1_000.0;
+
+#[derive(Debug, Clone)]
+pub struct AudioAlignment {
+    start_offset_reference_seconds: f64,
+    mic_timeline_ratio: f64,
+    drift_enabled: bool,
+    reason: String,
+}
+
+impl AudioAlignment {
+    pub fn none(reason: impl Into<String>) -> Self {
+        Self {
+            start_offset_reference_seconds: 0.0,
+            mic_timeline_ratio: 1.0,
+            drift_enabled: false,
+            reason: reason.into(),
+        }
+    }
+
+    /// Start offset between the two tracks on the reference clock, in seconds.
+    /// The merged output is longer than the longest track by up to this amount.
+    pub fn start_offset_seconds(&self) -> f64 {
+        self.start_offset_reference_seconds
+    }
+
+    pub fn fixed_offset(start_offset_ms: i64) -> Self {
+        Self::fixed_offset_seconds(
+            start_offset_ms as f64 / 1_000.0,
+            "explicit fixed offset",
+        )
+    }
+
+    pub fn affine(start_offset_seconds: f64, mic_timeline_ratio: f64) -> Self {
+        assert!(start_offset_seconds.is_finite(), "offset must be finite");
+        assert!(
+            mic_timeline_ratio.is_finite() && mic_timeline_ratio > 0.0,
+            "timeline ratio must be finite and positive"
+        );
+        Self {
+            start_offset_reference_seconds: start_offset_seconds,
+            mic_timeline_ratio,
+            drift_enabled: (mic_timeline_ratio - 1.0).abs() > f64::EPSILON,
+            reason: "trusted QPC affine fit".to_string(),
+        }
+    }
+
+    pub(crate) fn from_captures(
+        loopback: &crate::wasapi::capture_engine::CaptureTiming,
+        microphone: &crate::wasapi::capture_engine::CaptureTiming,
+    ) -> Self {
+        use crate::wasapi::capture_engine::fit_clock_model;
+
+        let wall_clock_fallback = |reason: String| {
+            let offset = start_time_offset_seconds(loopback.start_time, microphone.start_time);
+            match offset {
+                Some(seconds) => Self::fixed_offset_seconds(
+                    seconds,
+                    format!("wall-clock offset fallback: {reason}"),
+                ),
+                None => Self::none(format!("uncorrected fallback: {reason}")),
+            }
+        };
+
+        let loopback_model = match fit_clock_model(loopback) {
+            Ok(model) => model,
+            Err(reason) => return wall_clock_fallback(format!("loopback timing invalid: {reason}")),
+        };
+        let mic_model = match fit_clock_model(microphone) {
+            Ok(model) => model,
+            Err(reason) => return wall_clock_fallback(format!("microphone timing invalid: {reason}")),
+        };
+
+        let loopback_ticks_per_nominal_second =
+            loopback_model.qpc_100ns_per_wav_frame * f64::from(loopback.sample_rate);
+        let mic_ticks_per_nominal_second =
+            mic_model.qpc_100ns_per_wav_frame * f64::from(microphone.sample_rate);
+        let start_offset_reference_seconds =
+            (mic_model.qpc_origin_100ns - loopback_model.qpc_origin_100ns)
+                / loopback_ticks_per_nominal_second;
+        let mic_timeline_ratio =
+            mic_ticks_per_nominal_second / loopback_ticks_per_nominal_second;
+        let relative_rate_ppm = (mic_timeline_ratio - 1.0) * 1_000_000.0;
+        let fit_span_seconds = loopback_model
+            .span_seconds
+            .min(mic_model.span_seconds);
+        let residual_ms = loopback_model
+            .residual_100ns
+            .max(mic_model.residual_100ns)
+            / 10_000.0;
+
+        tracing::info!(
+            startup_displacement_ms = start_offset_reference_seconds * 1_000.0,
+            relative_rate_ppm,
+            fit_span_seconds,
+            residual_ms,
+            loopback_timestamp_errors = loopback.timestamp_error_count,
+            microphone_timestamp_errors = microphone.timestamp_error_count,
+            "Calculated audio capture alignment"
+        );
+
+        if !start_offset_reference_seconds.is_finite()
+            || !mic_timeline_ratio.is_finite()
+            || mic_timeline_ratio <= 0.0
+        {
+            return wall_clock_fallback("clock model produced non-finite alignment".to_string());
+        }
+        if fit_span_seconds < MIN_DRIFT_FIT_SECONDS {
+            return Self::fixed_offset_seconds(
+                start_offset_reference_seconds,
+                format!(
+                    "QPC offset only: {:.1}s fit span is shorter than {:.0}s",
+                    fit_span_seconds, MIN_DRIFT_FIT_SECONDS
+                ),
+            );
+        }
+        if relative_rate_ppm.abs() > MAX_RELATIVE_RATE_PPM {
+            return Self::fixed_offset_seconds(
+                start_offset_reference_seconds,
+                format!(
+                    "QPC offset only: relative rate {:.1} ppm exceeds {:.0} ppm",
+                    relative_rate_ppm, MAX_RELATIVE_RATE_PPM
+                ),
+            );
+        }
+
+        Self::affine(start_offset_reference_seconds, mic_timeline_ratio)
+    }
+
+    fn fixed_offset_seconds(seconds: f64, reason: impl Into<String>) -> Self {
+        if !seconds.is_finite() {
+            return Self::none("non-finite fixed offset");
+        }
+        Self {
+            start_offset_reference_seconds: seconds,
+            mic_timeline_ratio: 1.0,
+            drift_enabled: false,
+            reason: reason.into(),
+        }
+    }
+
+    fn delay_frames(&self, target_sample_rate: u32) -> u64 {
+        (self.start_offset_reference_seconds.abs() * f64::from(target_sample_rate)).round() as u64
+    }
+
+    fn relative_rate_ppm(&self) -> f64 {
+        (self.mic_timeline_ratio - 1.0) * 1_000_000.0
+    }
+}
+
+fn start_time_offset_seconds(
+    loopback: Option<std::time::Instant>,
+    microphone: Option<std::time::Instant>,
+) -> Option<f64> {
+    match (loopback, microphone) {
+        (Some(loopback), Some(microphone)) if loopback <= microphone => {
+            Some(microphone.duration_since(loopback).as_secs_f64())
+        }
+        (Some(loopback), Some(microphone)) => {
+            Some(-loopback.duration_since(microphone).as_secs_f64())
+        }
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingQuality {
@@ -77,10 +242,7 @@ pub async fn convert_wav_to_m4a(wav_path: &PathBuf, m4a_path: &PathBuf) -> Resul
 /// Output format: Dual-mono stereo (Left=system audio, Right=microphone)
 /// Supports direct M4A encoding (merge + encode in one pass for 50-70% faster processing)
 ///
-/// `start_offset_ms` compensates for the time difference between when each recorder's
-/// `audio_client.Start()` was called. Positive = loopback started first (common case),
-/// so we delay the loopback with `-itsoffset`. Negative = mic started first (rare).
-/// Zero = no compensation needed.
+/// `alignment` maps both captured WAV timelines onto the loopback reference clock.
 pub async fn merge_audio_streams_smart(
     loopback_wav: &PathBuf,
     mic_wav: &PathBuf,
@@ -92,7 +254,7 @@ pub async fn merge_audio_streams_smart(
     session_id: Option<&str>,
     observer: Option<std::sync::Arc<crate::status::JsonFileObserver>>,
     total_steps: u8,
-    start_offset_ms: i64,
+    alignment: &AudioAlignment,
 ) -> Result<()> {
     use std::process::Stdio;
     use std::time::Instant;
@@ -119,13 +281,12 @@ pub async fn merge_audio_streams_smart(
     tracing::info!("    • Output Format:          {}", format_str);
     tracing::info!("    • Output Sample Rate:     {} Hz", quality.sample_rate);
     tracing::info!("    • Output Channels:        {} (Stereo)", quality.channels);
-    if start_offset_ms != 0 {
-        tracing::info!("    • Start offset:           {} ms ({})",
-            start_offset_ms.abs(),
-            if start_offset_ms > 0 { "loopback started first, delaying loopback" }
-            else { "mic started first, delaying mic" }
-        );
-    }
+    tracing::info!(
+        "    - Alignment:              {} ({:.3} ms, {:.3} ppm)",
+        alignment.reason,
+        alignment.start_offset_reference_seconds * 1_000.0,
+        alignment.relative_rate_ppm()
+    );
 
     // Check if FFmpeg is available (cached on first run)
     use std::sync::OnceLock;
@@ -439,7 +600,36 @@ pub async fn merge_audio_streams_smart(
     };
 
     // Calculate max duration in seconds for use in filters (to pad shorter input)
-    let max_duration_secs = (effective_duration_ms as f64 / 1000.0).ceil() as u64;
+    let exact_wav_duration_seconds = |path: &PathBuf, fallback_ms: u64| {
+        hound::WavReader::open(path)
+            .ok()
+            .and_then(|reader| {
+                let sample_rate = reader.spec().sample_rate;
+                (sample_rate > 0)
+                    .then(|| f64::from(reader.duration()) / f64::from(sample_rate))
+            })
+            .unwrap_or(fallback_ms as f64 / 1_000.0)
+    };
+    let loopback_source_seconds =
+        exact_wav_duration_seconds(loopback_wav, loopback_duration_ms);
+    let mic_source_seconds = exact_wav_duration_seconds(mic_wav, mic_duration_ms);
+    let delay_frames = alignment.delay_frames(quality.sample_rate);
+    let delay_seconds = delay_frames as f64 / f64::from(quality.sample_rate);
+    let loopback_aligned_seconds = loopback_source_seconds
+        + if alignment.start_offset_reference_seconds < 0.0 {
+            delay_seconds
+        } else {
+            0.0
+        };
+    let mic_aligned_seconds = mic_source_seconds * alignment.mic_timeline_ratio
+        + if alignment.start_offset_reference_seconds > 0.0 {
+            delay_seconds
+        } else {
+            0.0
+        };
+    let common_duration_seconds = loopback_aligned_seconds
+        .max(mic_aligned_seconds)
+        .max(effective_duration_ms as f64 / 1_000.0);
 
     let output = if loopback_has_audio && mic_has_audio {
         // Scenario A: Both have audio - Create dual-mono stereo (L=loopback, R=mic)
@@ -482,45 +672,56 @@ pub async fn merge_audio_streams_smart(
             }
         };
 
-        // Build mic input filter chain — optionally prepend volume adjustment
-        let mic_filter = if mic_gain_db != 0.0 {
-            format!(
-                "[1:a]volume={:.1}dB,aformat=channel_layouts=mono,apad=whole_dur={},asplit=2[ml][mr]",
-                mic_gain_db, max_duration_secs
-            )
+        let loopback_delay_filter = if alignment.start_offset_reference_seconds < 0.0 {
+            format!("adelay=delays={}S:all=1,", delay_frames)
         } else {
-            format!(
-                "[1:a]aformat=channel_layouts=mono,apad=whole_dur={},asplit=2[ml][mr]",
-                max_duration_secs
-            )
+            String::new()
         };
-
-        let filter = format!(
-            "[0:a]aformat=channel_layouts=stereo,apad=whole_dur={}[left];{};[left][ml][mr]amerge=inputs=3,pan=stereo|c0<c0+c2|c1<c1+c2[aout]",
-            max_duration_secs, mic_filter
+        let loopback_filter = format!(
+            "[0:a]aresample={},{}aformat=channel_layouts=stereo,apad=whole_dur={:.9}[left]",
+            quality.sample_rate,
+            loopback_delay_filter,
+            common_duration_seconds
         );
 
-        // Convert offset to seconds for FFmpeg -itsoffset flag.
-        // Positive offset = loopback started first, so delay loopback to align with mic.
-        // Negative offset = mic started first, so delay mic to align with loopback.
-        let offset_secs = start_offset_ms.abs() as f64 / 1000.0;
-        let offset_str = format!("{:.3}", offset_secs);
+        let mic_gain_filter = if mic_gain_db != 0.0 {
+            format!("volume={:.1}dB,", mic_gain_db)
+        } else {
+            String::new()
+        };
+        let mic_rate_filter = if alignment.drift_enabled {
+            let mic_input_sample_rate = hound::WavReader::open(mic_wav)?.spec().sample_rate;
+            let corrected_rate = f64::from(mic_input_sample_rate) / alignment.mic_timeline_ratio;
+            format!(
+                "asetrate={:.12},aresample={},",
+                corrected_rate, quality.sample_rate
+            )
+        } else {
+            format!("aresample={},", quality.sample_rate)
+        };
+        let mic_delay_filter = if alignment.start_offset_reference_seconds > 0.0 {
+            format!("adelay=delays={}S:all=1,", delay_frames)
+        } else {
+            String::new()
+        };
+        let mic_filter = format!(
+            "[1:a]{}{}{}aformat=channel_layouts=mono,apad=whole_dur={:.9},asplit=2[ml][mr]",
+            mic_rate_filter,
+            mic_delay_filter,
+            mic_gain_filter,
+            common_duration_seconds
+        );
+
+        let filter = format!(
+            "{};{};[left][ml][mr]amerge=inputs=3,pan=stereo|c0<c0+c2|c1<c1+c2[aout]",
+            loopback_filter, mic_filter
+        );
 
         let mut cmd = setup_ffmpeg_command();
         cmd.arg("-hide_banner")
-            .arg("-loglevel").arg("error");
-
-        if start_offset_ms > 0 {
-            // Loopback started first: delay loopback input
-            cmd.arg("-itsoffset").arg(&offset_str);
-        }
-        cmd.arg("-i").arg(loopback_wav);
-
-        if start_offset_ms < 0 {
-            // Mic started first (rare): delay mic input
-            cmd.arg("-itsoffset").arg(&offset_str);
-        }
-        cmd.arg("-i").arg(mic_wav);
+            .arg("-loglevel").arg("error")
+            .arg("-i").arg(loopback_wav)
+            .arg("-i").arg(mic_wav);
 
         cmd.arg("-filter_complex")
             .arg(&filter)
@@ -551,48 +752,68 @@ pub async fn merge_audio_streams_smart(
 
         result
     } else if loopback_has_audio && !mic_has_audio {
-        // Scenario B: Loopback only - Convert to stereo (duplicate to both channels)
-        tracing::info!("📋 Merge Strategy: Using loopback only (duplicate system audio to stereo)");
+        // Scenario B: Loopback only - preserve its wall-clock position on the common timeline.
+        tracing::info!("📋 Merge Strategy: Using loopback only");
+        let loopback_delay_filter = if alignment.start_offset_reference_seconds < 0.0 {
+            format!("adelay=delays={}S:all=1,", delay_frames)
+        } else {
+            String::new()
+        };
+        let filter = format!(
+            "[0:a]aresample={},{}aformat=channel_layouts=stereo,apad=whole_dur={:.9}[aout]",
+            quality.sample_rate,
+            loopback_delay_filter,
+            common_duration_seconds
+        );
 
         let mut cmd = setup_ffmpeg_command();
         cmd.arg("-hide_banner")
             .arg("-loglevel").arg("error")
-            .arg("-i")
-            .arg(loopback_wav)
-            .arg("-ac").arg("2")  // Direct channel conversion to stereo (faster than filter_complex)
-            .arg("-ar")
-            .arg(&target_sample_rate);
+            .arg("-i").arg(loopback_wav)
+            .arg("-filter_complex").arg(filter)
+            .arg("-map").arg("[aout]")
+            .arg("-ar").arg(&target_sample_rate);
 
         add_encoding_params(&mut cmd, output_format);
-
-        cmd.arg("-y")
-            .arg(output_path);
-
-        let result = execute_ffmpeg(cmd).await?;
-
-        result
+        cmd.arg("-y").arg(output_path);
+        execute_ffmpeg(cmd).await?
     } else if !loopback_has_audio && mic_has_audio {
-        // Scenario C: Mic only - Convert mono to stereo (duplicate to both channels)
+        // Scenario C: Microphone only - correct its clock and preserve its wall-clock position.
         tracing::info!("📋 Merge Strategy: Using microphone only (duplicate user audio to stereo)");
+        let mic_rate_filter = if alignment.drift_enabled {
+            let mic_input_sample_rate = hound::WavReader::open(mic_wav)?.spec().sample_rate;
+            let corrected_rate = f64::from(mic_input_sample_rate) / alignment.mic_timeline_ratio;
+            format!(
+                "asetrate={:.12},aresample={},",
+                corrected_rate, quality.sample_rate
+            )
+        } else {
+            format!("aresample={},", quality.sample_rate)
+        };
+        let mic_delay_filter = if alignment.start_offset_reference_seconds > 0.0 {
+            format!("adelay=delays={}S:all=1,", delay_frames)
+        } else {
+            String::new()
+        };
+        let filter = format!(
+            "[0:a]{}{}aformat=channel_layouts=mono,apad=whole_dur={:.9},asplit=2[l][r];[l][r]amerge=inputs=2,pan=stereo|c0=c0|c1=c1[aout]",
+            mic_rate_filter,
+            mic_delay_filter,
+            common_duration_seconds
+        );
 
         let mut cmd = setup_ffmpeg_command();
         cmd.arg("-hide_banner")
             .arg("-loglevel").arg("error")
             .arg("-i").arg(mic_wav)
-            .arg("-filter_complex")
-            .arg("[0:a]aformat=channel_layouts=mono,asplit=2[l][r];[l][r]amerge=inputs=2,pan=stereo|c0=c0|c1=c1[aout]")
-            .arg("-filter_threads").arg("auto")  // Enable parallel filter processing
+            .arg("-filter_complex").arg(filter)
+            .arg("-filter_threads").arg("auto")
             .arg("-map").arg("[aout]")
             .arg("-ar").arg(&target_sample_rate);
 
         add_encoding_params(&mut cmd, output_format);
-
-        cmd.arg("-y")
-            .arg(output_path);
-
-        let result = execute_ffmpeg(cmd).await?;
-
-        result
+        cmd.arg("-y").arg(output_path);
+        execute_ffmpeg(cmd).await?
     } else {
         // Scenario D: Neither has audio — create a silent output file.
         //
@@ -663,6 +884,25 @@ pub async fn merge_audio_streams_smart(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // A failed merge leaves a truncated output file. Remove it so it cannot be
+        // mistaken for a good recording and so it does not hold disk space.
+        let _ = std::fs::remove_file(output_path);
+
+        if crate::disk_space::is_disk_full_failure(output.status.code(), &stderr) {
+            let free = crate::disk_space::available_bytes(output_path)
+                .map(crate::disk_space::format_mb)
+                .unwrap_or_else(|| "unknown".to_string());
+            anyhow::bail!(
+                "Disk full: FFmpeg could not finish writing {} (exit code {:?}, free now: {}). \
+                 Nothing was lost: the raw tracks are kept at {} and {}. Free up space, then merge them again.",
+                output_path.display(),
+                output.status.code(),
+                free,
+                loopback_wav.display(),
+                mic_wav.display()
+            );
+        }
+
         // When progress monitoring is enabled, stderr is consumed by the progress parser,
         // so the error message may be empty. Include file diagnostics to help debug.
         let stderr_msg = if stderr.trim().is_empty() {
@@ -737,4 +977,119 @@ pub async fn merge_audio_streams_smart(
 
     tracing::info!("═══════════════════════════════════════════════════════════");
     Ok(())
+}
+#[cfg(test)]
+mod alignment_tests {
+    use super::*;
+    use crate::wasapi::capture_engine::CaptureTiming;
+    use std::time::{Duration, Instant};
+
+    fn synthetic_timing(
+        origin_100ns: u64,
+        ticks_per_frame: f64,
+        span_seconds: u64,
+    ) -> CaptureTiming {
+        let mut timing = CaptureTiming::new(48_000);
+        for second in (0..=span_seconds).step_by(10) {
+            let frame = second * 48_000;
+            let qpc = origin_100ns + (frame as f64 * ticks_per_frame).round() as u64;
+            timing.record_packet(frame, frame + 1, qpc, 0);
+        }
+        timing
+    }
+
+    #[test]
+    fn alignment_recovers_startup_offset_and_relative_rate() {
+        let loopback = synthetic_timing(100_000_000, 200.0, 60);
+        let microphone = synthetic_timing(104_416_000, 200.02, 60);
+
+        let alignment = AudioAlignment::from_captures(&loopback, &microphone);
+
+        assert!((alignment.start_offset_reference_seconds - 0.460).abs() < 1e-9);
+        assert!((alignment.mic_timeline_ratio - 1.0001).abs() < 1e-9);
+        assert!(alignment.drift_enabled);
+    }
+
+    #[test]
+    fn alignment_recovers_microphone_first_and_faster_clock() {
+        let loopback = synthetic_timing(104_416_000, 200.0, 60);
+        let microphone = synthetic_timing(100_000_000, 199.98, 60);
+
+        let alignment = AudioAlignment::from_captures(&loopback, &microphone);
+
+        assert!((alignment.start_offset_reference_seconds + 0.460).abs() < 1e-9);
+        assert!((alignment.mic_timeline_ratio - 0.9999).abs() < 1e-9);
+        assert!(alignment.drift_enabled);
+    }
+
+    #[test]
+    fn short_capture_uses_qpc_offset_without_rate_correction() {
+        let loopback = synthetic_timing(100_000_000, 200.0, 20);
+        let microphone = synthetic_timing(104_416_000, 200.02, 20);
+
+        let alignment = AudioAlignment::from_captures(&loopback, &microphone);
+
+        assert!((alignment.start_offset_reference_seconds - 0.460).abs() < 1e-9);
+        assert_eq!(alignment.mic_timeline_ratio, 1.0);
+        assert!(!alignment.drift_enabled);
+        assert!(alignment.reason.contains("fit span"));
+    }
+
+    #[test]
+    fn timestamp_error_only_capture_falls_back_to_wall_clock_offset() {
+        let base = Instant::now();
+        let mut loopback = CaptureTiming::new(48_000);
+        loopback.set_start_time(base);
+        loopback.record_packet(0, 1, 1, 0x4);
+        let mut microphone = CaptureTiming::new(48_000);
+        microphone.set_start_time(base + Duration::from_millis(250));
+        microphone.record_packet(0, 1, 1, 0x4);
+
+        let alignment = AudioAlignment::from_captures(&loopback, &microphone);
+
+        assert!((alignment.start_offset_reference_seconds - 0.250).abs() < 1e-9);
+        assert_eq!(alignment.mic_timeline_ratio, 1.0);
+        assert!(alignment.reason.contains("wall-clock offset fallback"));
+    }
+
+    #[test]
+    fn excessive_relative_rate_is_rejected_to_offset_only() {
+        let loopback = synthetic_timing(100_000_000, 200.0, 60);
+        let microphone = synthetic_timing(104_416_000, 200.4, 60);
+
+        let alignment = AudioAlignment::from_captures(&loopback, &microphone);
+
+        assert_eq!(alignment.mic_timeline_ratio, 1.0);
+        assert!(!alignment.drift_enabled);
+        assert!(alignment.reason.contains("exceeds"));
+    }
+    #[test]
+    fn non_monotonic_clock_data_falls_back_to_wall_clock_offset() {
+        let base = Instant::now();
+        let mut loopback = CaptureTiming::new(48_000);
+        loopback.set_start_time(base);
+        loopback.record_packet(0, 1_000, 10_000, 0);
+        loopback.record_packet(480_000, 900, 20_000, 0);
+        let mut microphone = synthetic_timing(100_000_000, 200.0, 60);
+        microphone.set_start_time(base + Duration::from_millis(125));
+
+        let alignment = AudioAlignment::from_captures(&loopback, &microphone);
+
+        assert!((alignment.start_offset_reference_seconds - 0.125).abs() < 1e-9);
+        assert_eq!(alignment.mic_timeline_ratio, 1.0);
+        assert!(alignment.reason.contains("non-monotonic"));
+    }
+
+    #[test]
+    fn missing_timing_uses_explicit_uncorrected_fallback() {
+        let loopback = CaptureTiming::new(48_000);
+        let microphone = CaptureTiming::new(48_000);
+
+        let alignment = AudioAlignment::from_captures(&loopback, &microphone);
+
+        assert_eq!(alignment.start_offset_reference_seconds, 0.0);
+        assert_eq!(alignment.mic_timeline_ratio, 1.0);
+        assert!(!alignment.drift_enabled);
+        assert!(alignment.reason.contains("uncorrected fallback"));
+    }
 }

@@ -25,7 +25,8 @@
 use anyhow::{Context, Result};
 use crate::audio_utils::{calculate_rms_f32, calculate_rms_i16, calculate_rms_i32};
 use crate::wasapi::capture_engine::{
-    detect_sample_format, f32_to_i16, i32_to_i16, LoopbackCapture, SampleFormat, WriteErrorTracker,
+    classify_capture_fault, detect_sample_format, f32_to_i16, fill_wallclock_silence, i32_to_i16,
+    CaptureFault, CaptureHealth, CaptureTiming, FaultOutcome, LoopbackCapture, SampleFormat, WriteErrorTracker,
 };
 use hound::{WavSpec, WavWriter};
 use std::path::PathBuf;
@@ -44,8 +45,10 @@ pub struct WasapiLoopbackRecorder {
     has_audio: Arc<AtomicBool>,
     sample_rate: u32,
     start_time: Arc<Mutex<Option<Instant>>>,
+    capture_timing: Arc<Mutex<CaptureTiming>>,
     thread_handle: Option<std::thread::JoinHandle<Result<()>>>,
     write_errors: Arc<WriteErrorTracker>,
+    health: Arc<CaptureHealth>,
 }
 
 impl WasapiLoopbackRecorder {
@@ -59,12 +62,16 @@ impl WasapiLoopbackRecorder {
         let has_audio = Arc::new(AtomicBool::new(false));
         let write_errors = Arc::new(WriteErrorTracker::new());
         let start_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let capture_timing = Arc::new(Mutex::new(CaptureTiming::new(0)));
+        let health = Arc::new(CaptureHealth::new());
 
         let is_recording_clone = Arc::clone(&is_recording);
         let frames_captured_clone = Arc::clone(&frames_captured);
         let has_audio_clone = Arc::clone(&has_audio);
         let write_errors_clone = Arc::clone(&write_errors);
         let start_time_clone = Arc::clone(&start_time);
+        let capture_timing_clone = Arc::clone(&capture_timing);
+        let health_clone = Arc::clone(&health);
 
         // Get sample rate before spawning thread
         let sample_rate = unsafe {
@@ -94,16 +101,25 @@ impl WasapiLoopbackRecorder {
         };
 
         // Spawn recording thread that initializes its own COM
+        let failure_health = Arc::clone(&health);
         let handle = std::thread::spawn(move || {
-            Self::recording_thread(
+            let result = Self::recording_thread(
                 filepath,
                 is_recording_clone,
                 frames_captured_clone,
                 has_audio_clone,
                 write_errors_clone,
                 start_time_clone,
+                capture_timing_clone,
+                health_clone,
                 device_index,
-            )
+            );
+            // Report a failed start live; the status loop would otherwise only
+            // see it when the user presses stop.
+            if let Err(e) = &result {
+                failure_health.mark_failed(format!("system audio capture could not run: {:#}", e));
+            }
+            result
         });
 
         Ok(Self {
@@ -112,8 +128,10 @@ impl WasapiLoopbackRecorder {
             has_audio,
             sample_rate,
             start_time,
+            capture_timing,
             thread_handle: Some(handle),
             write_errors,
+            health,
         })
     }
 
@@ -124,6 +142,8 @@ impl WasapiLoopbackRecorder {
         has_audio: Arc<AtomicBool>,
         write_errors: Arc<WriteErrorTracker>,
         start_time: Arc<Mutex<Option<Instant>>>,
+        capture_timing: Arc<Mutex<CaptureTiming>>,
+        health: Arc<CaptureHealth>,
         device_index: Option<u32>,
     ) -> Result<()> {
         unsafe {
@@ -132,57 +152,21 @@ impl WasapiLoopbackRecorder {
                 .ok()
                 .context("Failed to initialize COM in recording thread")?;
 
-            // Get audio endpoint for rendering (speakers/output)
-            let device_enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            // Activate the loopback capture client from the default (or selected)
+            // render endpoint. Extracted into a helper so it can be re-invoked to
+            // rebuild the client if the device is invalidated mid-recording.
+            let mut active = activate_loopback_client(device_index)
+                .context("Failed to activate loopback audio client")?;
 
-            let device = if let Some(idx) = device_index {
-                tracing::info!("Using output device at index {}", idx);
-                let collection = device_enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-                collection.Item(idx).context(format!("Failed to get output device at index {}", idx))?
-            } else {
-                device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?
-            };
+            let sample_rate = active.sample_rate;
+            let channels = active.channels;
+            let sample_format = active.sample_format;
+            let channels_usize = channels as usize;
 
-            // Activate audio client
-            let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-
-            // Get mix format
-            let mix_format = audio_client.GetMixFormat()?;
-            let wf = &*mix_format;
-
-            // Copy packed struct fields to avoid alignment issues
-            let sample_rate = wf.nSamplesPerSec;
-            let channels = wf.nChannels;
-            let bits_per_sample = wf.wBitsPerSample;
-            let format_tag = wf.wFormatTag;
-
-            // Use shared format detection
-            let sample_format = detect_sample_format(format_tag, bits_per_sample);
-
-            tracing::info!(
-                "WASAPI format: {} Hz, {} channels, {} bits, format tag: 0x{:X}, detected: {:?}",
-                sample_rate,
-                channels,
-                bits_per_sample,
-                format_tag,
-                sample_format
-            );
-
-            // Initialize audio client in loopback mode
-            audio_client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                REFTIMES_PER_SEC, // 1 second buffer
-                0,
-                mix_format,
-                None,
-            )?;
-
-            // Get capture client
-            let capture_client: IAudioCaptureClient = audio_client.GetService()?;
-
-            // Create WAV writer - always use 16-bit PCM for compatibility
+            // Create WAV writer - always use 16-bit PCM for compatibility.
+            // The spec is fixed at the initial device's format; if a replacement
+            // device after recovery has a different format we keep this spec and
+            // fill silence rather than corrupt the stream (see handle_loopback_fault).
             let spec = WavSpec {
                 channels,
                 sample_rate,
@@ -194,12 +178,17 @@ impl WasapiLoopbackRecorder {
             let mut writer = Some(writer);
 
             // Start audio client
-            audio_client.Start()?;
+            active.audio_client.Start()?;
 
             // Record the wall-clock time when capture actually started.
-            // Used to compute the offset between loopback and mic for FFmpeg -itsoffset alignment.
+            // Used to compute the leading silence needed to align loopback and mic.
+            let capture_start = Instant::now();
             if let Ok(mut st) = start_time.lock() {
-                *st = Some(Instant::now());
+                *st = Some(capture_start);
+            }
+            if let Ok(mut timing) = capture_timing.lock() {
+                timing.set_sample_rate(sample_rate);
+                timing.set_start_time(capture_start);
             }
 
             tracing::info!(
@@ -212,30 +201,84 @@ impl WasapiLoopbackRecorder {
             // calculate how many silence frames are needed to keep the WAV duration
             // aligned with wall-clock time. This is more accurate than writing a fixed
             // amount per iteration, since thread::sleep(10ms) on Windows can actually
-            // sleep 15-16ms due to the default timer resolution.
+            // sleep 15-16ms due to the default timer resolution. The same silence-fill
+            // bridges the gap while a device is being rebuilt after invalidation, so
+            // recovered audio lands at the correct wall-clock position.
             let mut total_frames_written: u64 = 0;
             let recording_start = Instant::now();
-            let channels_usize = channels as usize;
+            let mut last_recovery_attempt: Option<Instant> = None;
 
             // Recording loop
             while is_recording.load(Ordering::Relaxed) {
                 // Wait a bit for buffer to fill
                 std::thread::sleep(Duration::from_millis(10));
 
-                let packet_length = capture_client.GetNextPacketSize()?;
+                let packet_length = match active.capture_client.GetNextPacketSize() {
+                    Ok(len) => len,
+                    Err(e) => {
+                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health, &capture_timing) {
+                            FaultOutcome::Continue => {
+                                // Keep the WAV aligned to wall-clock while the device
+                                // is down / being rebuilt, then retry on the next tick.
+                                fill_wallclock_silence(
+                                    &mut writer,
+                                    &mut total_frames_written,
+                                    recording_start,
+                                    sample_rate,
+                                    channels_usize,
+                                    &write_errors,
+                                );
+                                continue;
+                            }
+                            FaultOutcome::Fatal => {
+                                // End this stream only. The WAV is finalized below so
+                                // the audio captured so far is kept and merged.
+                                health.mark_failed(format!("system audio capture stopped: {}", e));
+                                break;
+                            }
+                        }
+                    }
+                };
 
                 if packet_length > 0 {
                     let mut buffer: *mut u8 = std::ptr::null_mut();
                     let mut num_frames = 0u32;
                     let mut flags = 0u32;
+                    let mut device_position = 0u64;
+                    let mut qpc_100ns = 0u64;
+                    let wav_frame = total_frames_written;
 
-                    capture_client.GetBuffer(
+                    if let Err(e) = active.capture_client.GetBuffer(
                         &mut buffer,
                         &mut num_frames,
                         &mut flags,
-                        None,
-                        None,
-                    )?;
+                        Some(&mut device_position),
+                        Some(&mut qpc_100ns),
+                    ) {
+                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health, &capture_timing) {
+                            FaultOutcome::Continue => {
+                                fill_wallclock_silence(
+                                    &mut writer,
+                                    &mut total_frames_written,
+                                    recording_start,
+                                    sample_rate,
+                                    channels_usize,
+                                    &write_errors,
+                                );
+                                continue;
+                            }
+                            FaultOutcome::Fatal => {
+                                // End this stream only. The WAV is finalized below so
+                                // the audio captured so far is kept and merged.
+                                health.mark_failed(format!("system audio capture stopped: {}", e));
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Ok(mut timing) = capture_timing.lock() {
+                        timing.record_packet(wav_frame, device_position, qpc_100ns, flags);
+                    }
 
                     if num_frames > 0 {
                         frames_captured.fetch_add(1, Ordering::Relaxed);
@@ -325,9 +368,8 @@ impl WasapiLoopbackRecorder {
                                 }
                                 SampleFormat::Unsupported => {
                                     tracing::warn!(
-                                        "Unsupported audio format: {} bits, tag: 0x{:X}",
-                                        bits_per_sample,
-                                        format_tag
+                                        "Unsupported audio format: {:?}, writing silence",
+                                        sample_format
                                     );
                                     // Write silence for unsupported formats
                                     if let Some(writer) = writer.as_mut() {
@@ -342,34 +384,36 @@ impl WasapiLoopbackRecorder {
                         }
                     }
 
-                    capture_client.ReleaseBuffer(num_frames)?;
-                } else {
-                    // No packets available: no system audio is playing.
-                    // Calculate how many frames SHOULD have been written by now based on
-                    // wall-clock time, then write silence to fill the gap. This is more
-                    // accurate than a fixed per-tick amount because thread::sleep(10ms)
-                    // on Windows can actually sleep 15-16ms due to timer resolution.
-                    let elapsed_secs = recording_start.elapsed().as_secs_f64();
-                    let expected_frames = (elapsed_secs * sample_rate as f64) as u64;
-
-                    if expected_frames > total_frames_written {
-                        let gap_frames = (expected_frames - total_frames_written) as usize;
-                        let gap_samples = gap_frames * channels_usize;
-
-                        if let Some(writer) = writer.as_mut() {
-                            for _ in 0..gap_samples {
-                                if let Err(e) = writer.write_sample(0i16) {
-                                    write_errors.record_error(&e);
-                                }
+                    // A ReleaseBuffer failure on an invalidated device is expected;
+                    // the client is torn down and rebuilt rather than killing the thread.
+                    if let Err(e) = active.capture_client.ReleaseBuffer(num_frames) {
+                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health, &capture_timing) {
+                            FaultOutcome::Continue => continue,
+                            FaultOutcome::Fatal => {
+                                // End this stream only. The WAV is finalized below so
+                                // the audio captured so far is kept and merged.
+                                health.mark_failed(format!("system audio capture stopped: {}", e));
+                                break;
                             }
                         }
-                        total_frames_written += gap_frames as u64;
                     }
+                } else {
+                    // No packets available: no system audio is playing.
+                    // Write wall-clock silence to keep the WAV duration aligned.
+                    fill_wallclock_silence(
+                        &mut writer,
+                        &mut total_frames_written,
+                        recording_start,
+                        sample_rate,
+                        channels_usize,
+                        &write_errors,
+                    );
                 }
             }
 
-            // Stop and cleanup
-            audio_client.Stop()?;
+            // Stop and cleanup. The client may already be dead (invalidated), so
+            // ignore a Stop error — the WAV still needs finalizing either way.
+            let _ = active.audio_client.Stop();
 
             if let Some(writer) = writer.take() {
                 writer.finalize()?;
@@ -379,7 +423,6 @@ impl WasapiLoopbackRecorder {
                 tracing::warn!("Some audio samples could not be written during loopback recording");
             }
 
-            CoTaskMemFree(Some(mix_format as *const _ as *const _));
             CoUninitialize();
 
             Ok(())
@@ -398,10 +441,31 @@ impl WasapiLoopbackRecorder {
         self.sample_rate
     }
 
+    /// Whether the output device is currently lost and being rebuilt.
+    pub fn is_device_lost(&self) -> bool {
+        self.health.is_device_lost()
+    }
+
+    /// How many times the capture client was rebuilt after device loss.
+    pub fn device_recoveries(&self) -> u64 {
+        self.health.recoveries()
+    }
+
+    /// Why the capture stream stopped early, if it did.
+    pub fn capture_failure(&self) -> Option<String> {
+        self.health.failure()
+    }
+
     /// Get the wall-clock time when audio_client.Start() was called.
     /// Returns None if the recording thread hasn't started yet.
     pub fn get_start_time(&self) -> Option<Instant> {
         self.start_time.lock().ok().and_then(|guard| *guard)
+    }
+    pub(crate) fn capture_timing(&self) -> CaptureTiming {
+        self.capture_timing
+            .lock()
+            .map(|timing| timing.snapshot())
+            .unwrap_or_else(|_| CaptureTiming::new(self.sample_rate))
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -414,26 +478,184 @@ impl WasapiLoopbackRecorder {
             loop {
                 if handle.is_finished() {
                     match handle.join() {
-                        Ok(result) => {
-                            if let Err(e) = result {
-                                tracing::error!("Loopback recording thread error: {}", e);
-                            }
-                        }
+                        Ok(result) => result?,
                         Err(_) => {
-                            tracing::error!("Loopback recording thread panicked");
+                            return Err(anyhow::anyhow!("Loopback recording thread panicked"));
                         }
                     }
                     break;
                 }
                 if start.elapsed() >= STOP_TIMEOUT {
-                    tracing::warn!("Loopback recording thread did not finish within {:?}, continuing", STOP_TIMEOUT);
-                    break;
+                    return Err(anyhow::anyhow!("Loopback recording thread did not finish within {:?}", STOP_TIMEOUT));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
 
         self.write_errors.ensure_complete("Loopback")
+    }
+}
+
+/// A live loopback capture client plus the format fields the recording loop needs.
+/// Rebuilt as a unit when the device is invalidated mid-recording.
+struct ActiveLoopbackClient {
+    audio_client: IAudioClient,
+    capture_client: IAudioCaptureClient,
+    sample_rate: u32,
+    channels: u16,
+    sample_format: SampleFormat,
+}
+
+/// Activate a loopback capture client from the default (or indexed) render
+/// endpoint and initialize it, returning the ready-to-start client.
+///
+/// # Safety
+/// Must be called on a thread that has initialized COM (`CoInitializeEx`). The
+/// returned COM interfaces are released on drop; the `WAVEFORMATEX` from
+/// `GetMixFormat` is freed here before returning, so no raw pointer escapes.
+unsafe fn activate_loopback_client(device_index: Option<u32>) -> Result<ActiveLoopbackClient> {
+    let device_enumerator: IMMDeviceEnumerator =
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+
+    let device = if let Some(idx) = device_index {
+        tracing::info!("Using output device at index {}", idx);
+        let collection = device_enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        collection
+            .Item(idx)
+            .context(format!("Failed to get output device at index {}", idx))?
+    } else {
+        device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?
+    };
+
+    let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+
+    let mix_format = audio_client.GetMixFormat()?;
+    let wf = &*mix_format;
+    // Copy packed struct fields to avoid alignment issues.
+    let sample_rate = wf.nSamplesPerSec;
+    let channels = wf.nChannels;
+    let bits_per_sample = wf.wBitsPerSample;
+    let format_tag = wf.wFormatTag;
+    let sample_format = detect_sample_format(format_tag, bits_per_sample);
+
+    tracing::info!(
+        "WASAPI format: {} Hz, {} channels, {} bits, format tag: 0x{:X}, detected: {:?}",
+        sample_rate,
+        channels,
+        bits_per_sample,
+        format_tag,
+        sample_format
+    );
+
+    let init_result = audio_client.Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        REFTIMES_PER_SEC, // 1 second buffer
+        0,
+        mix_format,
+        None,
+    );
+    // Free the mix format regardless of whether Initialize succeeded.
+    CoTaskMemFree(Some(mix_format as *const _ as *const _));
+    init_result?;
+
+    let capture_client: IAudioCaptureClient = audio_client.GetService()?;
+
+    Ok(ActiveLoopbackClient {
+        audio_client,
+        capture_client,
+        sample_rate,
+        channels,
+        sample_format,
+    })
+}
+
+/// Handle a WASAPI error raised by a capture call mid-recording.
+///
+/// Fatal errors stop the loop. Recoverable errors (device invalidated / audio
+/// service restarted) tear down the dead client and rebuild it from a fresh
+/// endpoint, at most once per second so a persistently-missing device does not
+/// spin. If the rebuilt device's format differs from the WAV spec we do not
+/// adopt it (that would corrupt the stream) and keep filling silence until a
+/// compatible device returns.
+///
+/// # Safety
+/// Must be called on the COM-initialized recording thread.
+unsafe fn handle_loopback_fault(
+    err: &windows::core::Error,
+    active: &mut ActiveLoopbackClient,
+    device_index: Option<u32>,
+    last_recovery_attempt: &mut Option<Instant>,
+    health: &CaptureHealth,
+    capture_timing: &Mutex<CaptureTiming>,
+) -> FaultOutcome {
+    let hr = err.code().0;
+    if classify_capture_fault(hr) == CaptureFault::Fatal {
+        tracing::error!(
+            "Loopback capture failed with unrecoverable error 0x{:08X}: {}",
+            hr as u32,
+            err
+        );
+        return FaultOutcome::Fatal;
+    }
+
+    if health.mark_lost() {
+        tracing::error!(
+            "Loopback device lost (0x{:08X}): {}. System audio is not being captured until the device is rebuilt",
+            hr as u32,
+            err
+        );
+    }
+
+    // Throttle rebuild attempts to once per second while the device is missing.
+    let now = Instant::now();
+    if let Some(prev) = *last_recovery_attempt {
+        if now.duration_since(prev) < Duration::from_secs(1) {
+            return FaultOutcome::Continue;
+        }
+    }
+    *last_recovery_attempt = Some(now);
+
+    tracing::warn!(
+        "Loopback device invalidated (0x{:08X}); rebuilding capture client to resume recording",
+        hr as u32
+    );
+
+    let rebuilt = match activate_loopback_client(device_index) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!("Loopback client rebuild failed: {}; will retry", e);
+            return FaultOutcome::Continue;
+        }
+    };
+
+    if rebuilt.sample_rate != active.sample_rate || rebuilt.channels != active.channels {
+        tracing::warn!(
+            "Replacement audio device format ({} Hz, {} ch) differs from the recording \
+             ({} Hz, {} ch); filling silence until a compatible device is available",
+            rebuilt.sample_rate,
+            rebuilt.channels,
+            active.sample_rate,
+            active.channels
+        );
+        return FaultOutcome::Continue;
+    }
+
+    match rebuilt.audio_client.Start() {
+        Ok(()) => {
+            tracing::info!("Loopback capture client rebuilt and restarted; recording resumed");
+            *active = rebuilt;
+            health.mark_recovered();
+            // The new client restarts its device position at zero.
+            if let Ok(mut timing) = capture_timing.lock() {
+                timing.begin_new_stream();
+            }
+            FaultOutcome::Continue
+        }
+        Err(e) => {
+            tracing::warn!("Rebuilt loopback client failed to start: {}; will retry", e);
+            FaultOutcome::Continue
+        }
     }
 }
 
@@ -459,5 +681,20 @@ impl LoopbackCapture for WasapiLoopbackRecorder {
 
     fn get_start_time(&self) -> Option<Instant> {
         WasapiLoopbackRecorder::get_start_time(self)
+    }
+    fn capture_timing(&self) -> CaptureTiming {
+        WasapiLoopbackRecorder::capture_timing(self)
+    }
+
+    fn is_device_lost(&self) -> bool {
+        WasapiLoopbackRecorder::is_device_lost(self)
+    }
+
+    fn device_recoveries(&self) -> u64 {
+        WasapiLoopbackRecorder::device_recoveries(self)
+    }
+
+    fn capture_failure(&self) -> Option<String> {
+        WasapiLoopbackRecorder::capture_failure(self)
     }
 }
