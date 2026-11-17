@@ -34,6 +34,11 @@ pub(crate) struct CaptureTiming {
     last_valid_anchor: Option<TimingAnchor>,
     non_monotonic_count: u64,
     anchor_next_valid_packet: bool,
+    /// Added to raw device positions so they keep counting across a rebuilt
+    /// capture client (a new client restarts its position at zero).
+    device_position_offset: u64,
+    /// Set by `begin_new_stream`; the next valid packet recomputes the offset.
+    rebase_pending: bool,
 }
 
 impl CaptureTiming {
@@ -46,7 +51,24 @@ impl CaptureTiming {
             last_valid_anchor: None,
             non_monotonic_count: 0,
             anchor_next_valid_packet: false,
+            device_position_offset: 0,
+            rebase_pending: false,
         }
+    }
+
+    /// Mark that the capture client was rebuilt after device loss.
+    ///
+    /// The new client's device position restarts at zero, which would look like
+    /// time running backwards and disable drift correction for the whole file.
+    /// The next valid packet is rebased so the position continues from the
+    /// last valid anchor plus the WAV frames written since (silence included).
+    /// Anchors on both sides of the restart are kept.
+    pub(crate) fn begin_new_stream(&mut self) {
+        if let Some(previous) = self.last_valid_anchor {
+            self.push_anchor(previous);
+        }
+        self.rebase_pending = true;
+        self.anchor_next_valid_packet = true;
     }
 
     pub(crate) fn set_sample_rate(&mut self, sample_rate: u32) {
@@ -76,9 +98,19 @@ impl CaptureTiming {
             return;
         }
 
+        if self.rebase_pending {
+            self.device_position_offset = match self.last_valid_anchor {
+                Some(previous) => (previous.device_position
+                    + wav_frame.saturating_sub(previous.wav_frame))
+                .saturating_sub(device_position),
+                None => 0,
+            };
+            self.rebase_pending = false;
+        }
+
         let anchor = TimingAnchor {
             wav_frame,
-            device_position,
+            device_position: device_position + self.device_position_offset,
             qpc_100ns,
         };
 
@@ -325,6 +357,11 @@ pub(crate) trait LoopbackCapture: Send {
     fn device_recoveries(&self) -> u64 {
         0
     }
+
+    /// Why the capture stream stopped early, if it did.
+    fn capture_failure(&self) -> Option<String> {
+        None
+    }
 }
 
 // ── Sample format detection ──
@@ -429,6 +466,8 @@ pub(crate) fn classify_capture_fault(hr: i32) -> CaptureFault {
 pub(crate) struct CaptureHealth {
     device_lost: AtomicBool,
     recoveries: AtomicU64,
+    /// Set when the stream stopped for good (unrecoverable error).
+    failure: Mutex<Option<String>>,
 }
 
 impl CaptureHealth {
@@ -454,6 +493,20 @@ impl CaptureHealth {
 
     pub(crate) fn recoveries(&self) -> u64 {
         self.recoveries.load(Ordering::Relaxed)
+    }
+
+    /// Record that the stream stopped for good. The first reason is kept.
+    pub(crate) fn mark_failed(&self, reason: impl Into<String>) {
+        if let Ok(mut failure) = self.failure.lock() {
+            if failure.is_none() {
+                *failure = Some(reason.into());
+            }
+        }
+    }
+
+    /// Why the stream stopped early, if it did.
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
     }
 }
 
@@ -961,6 +1014,56 @@ mod tests {
         assert!(!health.is_device_lost());
         assert_eq!(health.recoveries(), 1);
         assert!(health.mark_lost(), "a second loss after recovery is a new transition");
+    }
+
+    #[test]
+    fn capture_health_keeps_first_failure() {
+        let health = CaptureHealth::new();
+        assert_eq!(health.failure(), None);
+
+        health.mark_failed("first");
+        health.mark_failed("second");
+
+        assert_eq!(health.failure().as_deref(), Some("first"));
+    }
+
+    /// Packets for a 48 kHz capture at 200 QPC ticks per frame. The device
+    /// position restarts at `restart_position` from `restart_frame` on, as a
+    /// rebuilt client does.
+    fn record_restarting_capture(timing: &mut CaptureTiming, mark_restart: bool) {
+        let origin = 50_000_000u64;
+        for frame in [0u64, 480_000, 960_000] {
+            timing.record_packet(frame, 10_000 + frame, origin + frame * 200, 0);
+        }
+        if mark_restart {
+            timing.begin_new_stream();
+        }
+        for frame in [1_440_000u64, 1_920_000, 2_400_000] {
+            let restarted_position = 500 + (frame - 1_440_000);
+            timing.record_packet(frame, restarted_position, origin + frame * 200, 0);
+        }
+    }
+
+    #[test]
+    fn restarted_device_position_without_rebase_disables_clock_model() {
+        let mut timing = CaptureTiming::new(48_000);
+        record_restarting_capture(&mut timing, false);
+
+        let error = fit_clock_model(&timing).unwrap_err();
+
+        assert!(error.contains("non-monotonic"));
+    }
+
+    #[test]
+    fn begin_new_stream_keeps_clock_model_valid_after_rebuild() {
+        let mut timing = CaptureTiming::new(48_000);
+        record_restarting_capture(&mut timing, true);
+
+        let model = fit_clock_model(&timing).expect("rebased capture stays monotonic");
+
+        assert_eq!(timing.non_monotonic_count, 0);
+        assert!((model.qpc_100ns_per_wav_frame - 200.0).abs() < 1e-9);
+        assert!((model.qpc_origin_100ns - 50_000_000.0).abs() < 1.0);
     }
 
     #[test]

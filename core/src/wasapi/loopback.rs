@@ -101,8 +101,9 @@ impl WasapiLoopbackRecorder {
         };
 
         // Spawn recording thread that initializes its own COM
+        let failure_health = Arc::clone(&health);
         let handle = std::thread::spawn(move || {
-            Self::recording_thread(
+            let result = Self::recording_thread(
                 filepath,
                 is_recording_clone,
                 frames_captured_clone,
@@ -112,7 +113,13 @@ impl WasapiLoopbackRecorder {
                 capture_timing_clone,
                 health_clone,
                 device_index,
-            )
+            );
+            // Report a failed start live; the status loop would otherwise only
+            // see it when the user presses stop.
+            if let Err(e) = &result {
+                failure_health.mark_failed(format!("system audio capture could not run: {:#}", e));
+            }
+            result
         });
 
         Ok(Self {
@@ -209,7 +216,7 @@ impl WasapiLoopbackRecorder {
                 let packet_length = match active.capture_client.GetNextPacketSize() {
                     Ok(len) => len,
                     Err(e) => {
-                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health) {
+                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health, &capture_timing) {
                             FaultOutcome::Continue => {
                                 // Keep the WAV aligned to wall-clock while the device
                                 // is down / being rebuilt, then retry on the next tick.
@@ -224,13 +231,10 @@ impl WasapiLoopbackRecorder {
                                 continue;
                             }
                             FaultOutcome::Fatal => {
-                                if let Some(writer) = writer.take() {
-                                    let _ = writer.finalize();
-                                }
-                                return Err(anyhow::anyhow!(
-                                    "Loopback capture failed with unrecoverable error: {}",
-                                    e
-                                ));
+                                // End this stream only. The WAV is finalized below so
+                                // the audio captured so far is kept and merged.
+                                health.mark_failed(format!("system audio capture stopped: {}", e));
+                                break;
                             }
                         }
                     }
@@ -251,7 +255,7 @@ impl WasapiLoopbackRecorder {
                         Some(&mut device_position),
                         Some(&mut qpc_100ns),
                     ) {
-                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health) {
+                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health, &capture_timing) {
                             FaultOutcome::Continue => {
                                 fill_wallclock_silence(
                                     &mut writer,
@@ -264,13 +268,10 @@ impl WasapiLoopbackRecorder {
                                 continue;
                             }
                             FaultOutcome::Fatal => {
-                                if let Some(writer) = writer.take() {
-                                    let _ = writer.finalize();
-                                }
-                                return Err(anyhow::anyhow!(
-                                    "Loopback capture failed with unrecoverable error: {}",
-                                    e
-                                ));
+                                // End this stream only. The WAV is finalized below so
+                                // the audio captured so far is kept and merged.
+                                health.mark_failed(format!("system audio capture stopped: {}", e));
+                                break;
                             }
                         }
                     }
@@ -386,16 +387,13 @@ impl WasapiLoopbackRecorder {
                     // A ReleaseBuffer failure on an invalidated device is expected;
                     // the client is torn down and rebuilt rather than killing the thread.
                     if let Err(e) = active.capture_client.ReleaseBuffer(num_frames) {
-                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health) {
+                        match handle_loopback_fault(&e, &mut active, device_index, &mut last_recovery_attempt, &health, &capture_timing) {
                             FaultOutcome::Continue => continue,
                             FaultOutcome::Fatal => {
-                                if let Some(writer) = writer.take() {
-                                    let _ = writer.finalize();
-                                }
-                                return Err(anyhow::anyhow!(
-                                    "Loopback capture failed with unrecoverable error: {}",
-                                    e
-                                ));
+                                // End this stream only. The WAV is finalized below so
+                                // the audio captured so far is kept and merged.
+                                health.mark_failed(format!("system audio capture stopped: {}", e));
+                                break;
                             }
                         }
                     }
@@ -451,6 +449,11 @@ impl WasapiLoopbackRecorder {
     /// How many times the capture client was rebuilt after device loss.
     pub fn device_recoveries(&self) -> u64 {
         self.health.recoveries()
+    }
+
+    /// Why the capture stream stopped early, if it did.
+    pub fn capture_failure(&self) -> Option<String> {
+        self.health.failure()
     }
 
     /// Get the wall-clock time when audio_client.Start() was called.
@@ -584,6 +587,7 @@ unsafe fn handle_loopback_fault(
     device_index: Option<u32>,
     last_recovery_attempt: &mut Option<Instant>,
     health: &CaptureHealth,
+    capture_timing: &Mutex<CaptureTiming>,
 ) -> FaultOutcome {
     let hr = err.code().0;
     if classify_capture_fault(hr) == CaptureFault::Fatal {
@@ -642,6 +646,10 @@ unsafe fn handle_loopback_fault(
             tracing::info!("Loopback capture client rebuilt and restarted; recording resumed");
             *active = rebuilt;
             health.mark_recovered();
+            // The new client restarts its device position at zero.
+            if let Ok(mut timing) = capture_timing.lock() {
+                timing.begin_new_stream();
+            }
             FaultOutcome::Continue
         }
         Err(e) => {
@@ -684,5 +692,9 @@ impl LoopbackCapture for WasapiLoopbackRecorder {
 
     fn device_recoveries(&self) -> u64 {
         WasapiLoopbackRecorder::device_recoveries(self)
+    }
+
+    fn capture_failure(&self) -> Option<String> {
+        WasapiLoopbackRecorder::capture_failure(self)
     }
 }

@@ -414,6 +414,14 @@ async fn record_worker(
         let observer = Arc::new(JsonFileObserver::new(config.status_dir.clone()));
         let effective_duration = session.duration.effective_duration();
 
+        // Why a capture stream stopped early, one entry per stream. Empty when
+        // both streams ran to the end. Drives the final message and event.
+        #[allow(unused_mut)]
+        let mut stream_failures: Vec<String> = Vec::new();
+        // How many times a lost device was rebuilt; each left a few silent seconds.
+        #[allow(unused_mut)]
+        let mut total_device_recoveries: u64 = 0;
+
         // Use WASAPI dual-channel recording on Windows (loopback + microphone)
         #[cfg(windows)]
         {
@@ -635,6 +643,8 @@ async fn record_worker(
         let mut prev_loopback_device_lost = false;
         let mut prev_mic_device_lost: Option<bool> = mic_recorder.as_ref().map(|_| false);
         let mut prev_device_recoveries: u64 = 0;
+        let mut reported_loopback_failure = false;
+        let mut reported_mic_failure = false;
 
         // Check for signals and state changes every second
         let check_interval = config.signal_check_interval;
@@ -777,6 +787,30 @@ async fn record_worker(
             let cur_device_recoveries = loopback_recorder.device_recoveries()
                 + mic_recorder.as_ref().map(|m| m.device_recoveries()).unwrap_or(0);
 
+            // A stream that stopped for good is reported once, as it happens.
+            for (stream, failure, reported) in [
+                ("system audio", loopback_recorder.capture_failure(), &mut reported_loopback_failure),
+                (
+                    "microphone",
+                    mic_recorder.as_ref().and_then(|m| m.capture_failure()),
+                    &mut reported_mic_failure,
+                ),
+            ] {
+                if let Some(reason) = failure {
+                    if !*reported {
+                        *reported = true;
+                        tracing::error!("The {} stream stopped early: {}", stream, reason);
+                        emit_event(&json!({
+                            "type": "warning",
+                            "session_id": session.id.as_str(),
+                            "code": "stream_failed",
+                            "message": format!("The {} recording stopped: {}. The rest of the session is recorded without it.", stream, reason)
+                        }));
+                        output.warning(&format!("{} recording stopped: {}", stream, reason));
+                    }
+                }
+            }
+
             for (stream, was_lost, is_lost) in [
                 ("system audio", prev_loopback_device_lost, cur_loopback_device_lost),
                 (
@@ -882,8 +916,22 @@ async fn record_worker(
         let mut loopback_recorder = loopback_recorder;
         let loopback_stop_result = loopback_recorder.stop();
         let loopback_timing = loopback_recorder.capture_timing();
+        stream_failures.extend(loopback_recorder.capture_failure());
+        if loopback_recorder.is_device_lost() {
+            stream_failures.push(
+                "the system audio device was still disconnected when the recording stopped".to_string(),
+            );
+        }
+        total_device_recoveries += loopback_recorder.device_recoveries();
         let (mic_stop_result, mic_timing) = if let Some(mut mic) = mic_recorder.take() {
             let stop_result = mic.stop();
+            stream_failures.extend(mic.capture_failure());
+            if mic.is_device_lost() {
+                stream_failures.push(
+                    "the microphone was still disconnected when the recording stopped".to_string(),
+                );
+            }
+            total_device_recoveries += mic.device_recoveries();
             (stop_result, Some(mic.capture_timing()))
         } else {
             (Ok(()), None)
@@ -897,7 +945,21 @@ async fn record_worker(
 
         let actual_elapsed = start_time.elapsed().as_secs();
         tracing::info!("Recording completed after {}s, starting post-processing", actual_elapsed);
-        output.success("Recording completed successfully!");
+        if stream_failures.is_empty() && total_device_recoveries == 0 {
+            output.success("Recording completed successfully!");
+        } else if stream_failures.is_empty() {
+            output.success(format!(
+                "Recording completed. The audio device dropped and reconnected {} time(s); a few seconds are silent each time.",
+                total_device_recoveries
+            ));
+        } else {
+            // Never claim success when a stream stopped early: the file will be
+            // missing that stream from the point it stopped.
+            output.warning(&format!(
+                "Recording stopped, but part of it is missing: {}",
+                stream_failures.join("; ")
+            ));
+        }
 
         emit_event(&json!({
             "type": "processing",
@@ -1067,6 +1129,20 @@ async fn record_worker(
             .unwrap_or("unknown")
             .to_string();
 
+        let completion_message = if stream_failures.is_empty() && total_device_recoveries == 0 {
+            "Recording completed successfully".to_string()
+        } else if stream_failures.is_empty() {
+            format!(
+                "Recording completed. The audio device dropped and reconnected {} time(s); a few seconds are silent each time",
+                total_device_recoveries
+            )
+        } else {
+            format!(
+                "Recording saved, but part of it is missing: {}",
+                stream_failures.join("; ")
+            )
+        };
+
         // Write final status to status file
         observer.on_complete(RecordingResult {
             status: "completed".to_string(),
@@ -1077,7 +1153,7 @@ async fn record_worker(
             file_size_mb: format!("{:.2}", file_size_mb),
             format: session.format.to_string(),
             codec: session.format.codec().to_string(),
-            message: "Recording completed successfully".to_string(),
+            message: completion_message.clone(),
         })?;
 
         // Emit completed event to stdout (this is what the calling tool reads)
@@ -1089,7 +1165,9 @@ async fn record_worker(
             "file_size_mb": format!("{:.2}", file_size_mb),
             "format": session.format.to_string(),
             "duration_secs": session.duration.to_api_value(),
-            "message": "Recording completed successfully"
+            "message": completion_message,
+            "warnings": stream_failures,
+            "device_recoveries": total_device_recoveries,
         }));
 
         Ok(())
